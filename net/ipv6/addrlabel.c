@@ -29,6 +29,7 @@ struct ip6addrlbl_entry {
 	int ifindex;
 	int addrtype;
 	u32 label;
+	u32 precedence;
 	struct hlist_node list;
 	struct rcu_head rcu;
 };
@@ -36,71 +37,86 @@ struct ip6addrlbl_entry {
 /*
  * Default policy table (RFC6724 + extensions)
  *
- * prefix		addr_type	label
+ * prefix		addr_type	label	precedence
  * -------------------------------------------------------------------------
- * ::1/128		LOOPBACK	0
- * ::/0			N/A		1
- * 2002::/16		N/A		2
- * ::/96		COMPATv4	3
- * ::ffff:0:0/96	V4MAPPED	4
- * fc00::/7		N/A		5		ULA (RFC 4193)
- * 2001::/32		N/A		6		Teredo (RFC 4380)
- * 2001:10::/28		N/A		7		ORCHID (RFC 4843)
- * fec0::/10		N/A		11		Site-local
+ * ::1/128		LOOPBACK	0	50
+ * ::/0			N/A		1	40
+ * 2002::/16		N/A		2	5
+ * ::/96		COMPATv4	3	1
+ * ::ffff:0:0/96	V4MAPPED	4	20
+ * fc00::/7		N/A		5	30	ULA (RFC 4193)
+ * 2001::/32		N/A		6	5	Teredo (RFC 4380)
+ * 2001:10::/28		N/A		7	-	ORCHID (RFC 4843)
+ * fec0::/10		N/A		11	1	Site-local
  *							(deprecated by RFC3879)
- * 3ffe::/16		N/A		12		6bone
+ * 3ffe::/16		N/A		12	1	6bone
  *
  * Note: 0xffffffff is used if we do not have any policies.
  * Note: Labels for ULA and 6to4 are different from labels listed in RFC6724.
+ * Note: The precedences are the ones updated by
+ *	 draft-ietf-6man-rfc6724-update. The kernel does not use them itself,
+ *	 they are exported for destination address selection in userspace.
  */
 
 #define IPV6_ADDR_LABEL_DEFAULT	0xffffffffUL
+#define IPV6_ADDR_PRECEDENCE_NONE	0xffffffffUL
 
 static const __net_initconst struct ip6addrlbl_init_table
 {
 	const struct in6_addr *prefix;
 	int prefixlen;
 	u32 label;
+	u32 precedence;
 } ip6addrlbl_init_table[] = {
 	{	/* ::/0 */
 		.prefix = &in6addr_any,
 		.label = 1,
+		.precedence = 40,
 	}, {	/* fc00::/7 */
 		.prefix = &(struct in6_addr){ { { 0xfc } } } ,
 		.prefixlen = 7,
 		.label = 5,
+		.precedence = 30,
 	}, {	/* fec0::/10 */
 		.prefix = &(struct in6_addr){ { { 0xfe, 0xc0 } } },
 		.prefixlen = 10,
 		.label = 11,
+		.precedence = 1,
 	}, {	/* 2002::/16 */
 		.prefix = &(struct in6_addr){ { { 0x20, 0x02 } } },
 		.prefixlen = 16,
 		.label = 2,
+		.precedence = 5,
 	}, {	/* 3ffe::/16 */
 		.prefix = &(struct in6_addr){ { { 0x3f, 0xfe } } },
 		.prefixlen = 16,
 		.label = 12,
+		.precedence = 1,
 	}, {	/* 2001::/32 */
 		.prefix = &(struct in6_addr){ { { 0x20, 0x01 } } },
 		.prefixlen = 32,
 		.label = 6,
+		.precedence = 5,
 	}, {	/* 2001:10::/28 */
 		.prefix = &(struct in6_addr){ { { 0x20, 0x01, 0x00, 0x10 } } },
 		.prefixlen = 28,
 		.label = 7,
+		.precedence = IPV6_ADDR_PRECEDENCE_NONE,
 	}, {	/* ::ffff:0:0 */
 		.prefix = &(struct in6_addr){ { { [10] = 0xff, [11] = 0xff } } },
 		.prefixlen = 96,
 		.label = 4,
+		.precedence = 20,
 	}, {	/* ::/96 */
 		.prefix = &in6addr_any,
 		.prefixlen = 96,
 		.label = 3,
+		.precedence = 1,
 	}, {	/* ::1/128 */
 		.prefix = &in6addr_loopback,
 		.prefixlen = 128,
 		.label = 0,
+		.precedence = 50,
 	}
 };
 
@@ -153,7 +169,7 @@ u32 ipv6_addr_label(struct net *net,
 /* allocate one entry */
 static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 						 int prefixlen, int ifindex,
-						 u32 label)
+						 u32 label, u32 precedence)
 {
 	struct ip6addrlbl_entry *newp;
 	int addrtype;
@@ -189,6 +205,7 @@ static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 	newp->ifindex = ifindex;
 	newp->addrtype = addrtype;
 	newp->label = label;
+	newp->precedence = precedence;
 	INIT_HLIST_NODE(&newp->list);
 	return newp;
 }
@@ -242,7 +259,7 @@ out:
 /* add a label */
 static int ip6addrlbl_add(struct net *net,
 			  const struct in6_addr *prefix, int prefixlen,
-			  int ifindex, u32 label, int replace)
+			  int ifindex, u32 label, u32 precedence, int replace)
 {
 	struct ip6addrlbl_entry *newp;
 	int ret = 0;
@@ -250,7 +267,7 @@ static int ip6addrlbl_add(struct net *net,
 	net_dbg_ratelimited("%s(prefix=%pI6, prefixlen=%d, ifindex=%d, label=%u, replace=%d)\n",
 			    __func__, prefix, prefixlen, ifindex, (unsigned int)label, replace);
 
-	newp = ip6addrlbl_alloc(prefix, prefixlen, ifindex, label);
+	newp = ip6addrlbl_alloc(prefix, prefixlen, ifindex, label, precedence);
 	if (IS_ERR(newp))
 		return PTR_ERR(newp);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
@@ -319,7 +336,8 @@ static int __net_init ip6addrlbl_net_init(struct net *net)
 				     ip6addrlbl_init_table[i].prefix,
 				     ip6addrlbl_init_table[i].prefixlen,
 				     0,
-				     ip6addrlbl_init_table[i].label, 0);
+				     ip6addrlbl_init_table[i].label,
+				     ip6addrlbl_init_table[i].precedence, 0);
 		if (err)
 			goto err_ip6addrlbl_add;
 	}
@@ -365,6 +383,7 @@ void ipv6_addr_label_cleanup(void)
 static const struct nla_policy ifal_policy[IFAL_MAX+1] = {
 	[IFAL_ADDRESS]		= { .len = sizeof(struct in6_addr), },
 	[IFAL_LABEL]		= { .len = sizeof(u32), },
+	[IFAL_PRECEDENCE]	= { .type = NLA_U32, },
 };
 
 static bool addrlbl_ifindex_exists(struct net *net, int ifindex)
@@ -385,6 +404,7 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 	struct net *net = sock_net(skb->sk);
 	struct ifaddrlblmsg *ifal;
 	struct nlattr *tb[IFAL_MAX+1];
+	u32 precedence = IPV6_ADDR_PRECEDENCE_NONE;
 	struct in6_addr *pfx;
 	u32 label;
 	int err = 0;
@@ -410,6 +430,15 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (label == IPV6_ADDR_LABEL_DEFAULT)
 		return -EINVAL;
 
+	if (tb[IFAL_PRECEDENCE]) {
+		precedence = nla_get_u32(tb[IFAL_PRECEDENCE]);
+		if (precedence == IPV6_ADDR_PRECEDENCE_NONE) {
+			NL_SET_ERR_MSG_ATTR(extack, tb[IFAL_PRECEDENCE],
+					    "Invalid precedence");
+			return -EINVAL;
+		}
+	}
+
 	switch (nlh->nlmsg_type) {
 	case RTM_NEWADDRLABEL:
 		if (ifal->ifal_index &&
@@ -417,7 +446,7 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 			return -EINVAL;
 
 		err = ip6addrlbl_add(net, pfx, ifal->ifal_prefixlen,
-				     ifal->ifal_index, label,
+				     ifal->ifal_index, label, precedence,
 				     nlh->nlmsg_flags & NLM_F_REPLACE);
 		break;
 	case RTM_DELADDRLABEL:
@@ -456,7 +485,9 @@ static int ip6addrlbl_fill(struct sk_buff *skb,
 	ip6addrlbl_putmsg(nlh, p->prefixlen, p->ifindex, lseq);
 
 	if (nla_put_in6_addr(skb, IFAL_ADDRESS, &p->prefix) < 0 ||
-	    nla_put_u32(skb, IFAL_LABEL, p->label) < 0) {
+	    nla_put_u32(skb, IFAL_LABEL, p->label) < 0 ||
+	    (p->precedence != IPV6_ADDR_PRECEDENCE_NONE &&
+	     nla_put_u32(skb, IFAL_PRECEDENCE, p->precedence) < 0)) {
 		nlmsg_cancel(skb, nlh);
 		return -EMSGSIZE;
 	}
@@ -529,7 +560,8 @@ static inline int ip6addrlbl_msgsize(void)
 {
 	return NLMSG_ALIGN(sizeof(struct ifaddrlblmsg))
 		+ nla_total_size(16)	/* IFAL_ADDRESS */
-		+ nla_total_size(4);	/* IFAL_LABEL */
+		+ nla_total_size(4)	/* IFAL_LABEL */
+		+ nla_total_size(4);	/* IFAL_PRECEDENCE */
 }
 
 static int ip6addrlbl_valid_get_req(struct sk_buff *skb,

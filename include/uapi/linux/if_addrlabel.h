@@ -25,6 +25,7 @@ struct ifaddrlblmsg {
 enum {
 	IFAL_ADDRESS = 1,
 	IFAL_LABEL = 2,
+	IFAL_PRECEDENCE = 3,	/* u32, RFC 6724 precedence */
 	__IFAL_MAX
 };
 
