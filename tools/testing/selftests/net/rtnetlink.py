@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
 
+import errno
+import json
+import os
 import socket
 import struct
 import time
 from lib.py import bkg, ip, ksft_exit, ksft_run, ksft_eq, ksft_ge, ksft_true, KsftSkipEx
-from lib.py import ksft_not_in, ksft_not_none
+from lib.py import ksft_busy_wait, ksft_not_in, ksft_not_none
 from lib.py import CmdExitFailure, NetNS, NetNSEnter, RtnlAddrFamily, RtnlRouteFamily
-from lib.py import defer
+from lib.py import Netlink, defer
 
 IPV4_ALL_HOSTS_MULTICAST = b'\xe0\x00\x00\x01'
 IPV4_TEST_MULTICAST = b'\xef\x01\x01\x01'
@@ -198,8 +201,11 @@ def ipv6_route_del_reason_expired() -> None:
             ksft_eq(attrs.get('del-reason'), 'expired')
 
 
-def _send_ra(sock, ifindex, lifetime, rio=None, pio=None):
-    """The kernel fills in the ICMPv6 checksum on raw ICMPv6 sockets."""
+def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80):
+    """
+    The kernel fills in the ICMPv6 checksum on raw ICMPv6 sockets.
+    The PIO is on-link only (L set, A clear) unless pio_flags says otherwise.
+    """
 
     # type, code, cksum, hop limit, flags, router lifetime,
     # reachable time, retrans timer
@@ -211,8 +217,9 @@ def _send_ra(sock, ifindex, lifetime, rio=None, pio=None):
         ra += socket.inet_pton(socket.AF_INET6, prefix)[:8]
     if pio is not None:
         prefix, plen, valid_lft = pio
-        # RFC 4861 prefix information option, on-link only (L set, A clear)
-        ra += struct.pack('!BBBBIII', 3, 4, plen, 0x80, valid_lft, 0, 0)
+        # RFC 4861 prefix information option
+        ra += struct.pack('!BBBBIII', 3, 4, plen, pio_flags, valid_lft,
+                          valid_lft, 0)
         ra += socket.inet_pton(socket.AF_INET6, prefix)
     sock.sendto(ra, ('ff02::1', 0, 0, ifindex))
 
@@ -314,11 +321,298 @@ def ipv6_route_del_reason_absent() -> None:
                         "user deletion must not carry del-reason")
 
 
+def _in6(addr):
+    return socket.inet_pton(socket.AF_INET6, addr)
+
+
+def _ntop6(addr):
+    return socket.inet_ntop(socket.AF_INET6, addr)
+
+
+def _saddr(daddr):
+    """Source address the kernel selects when connecting to daddr."""
+
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+        sock.connect((daddr, 9))
+        return sock.getsockname()[0]
+
+
+def _route_get_saddr(daddr):
+    """Source address reported by RTM_GETROUTE for daddr."""
+
+    return ip(f"-6 route get {daddr}", json=True)[0].get('prefsrc')
+
+
+def _nlattr(atype, value):
+    attr = struct.pack('=HH', 4 + len(value), atype) + value
+    return attr + b'\0' * (-len(attr) % 4)
+
+
+def _rtnl_request(msg_type, flags, header, attrs=b''):
+    """
+    Send a raw rtnetlink request, return (errno, replies) where replies are
+    (header, {attribute type: payload}) tuples.
+    """
+
+    payload = header + attrs
+    msg = struct.pack('=IHHII', 16 + len(payload), msg_type,
+                      Netlink.NLM_F_REQUEST | flags, 1, 0) + payload
+    replies = []
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW,
+                       socket.NETLINK_ROUTE) as sock:
+        sock.send(msg)
+        while True:
+            data = sock.recv(65536)
+            off = 0
+            while off < len(data):
+                nl_len, nl_type = struct.unpack_from('=IH', data, off)
+                if nl_type == Netlink.NLMSG_DONE:
+                    return 0, replies
+                if nl_type == Netlink.NLMSG_ERROR:
+                    err, = struct.unpack_from('=i', data, off + 16)
+                    return err, replies
+                hdr = data[off + 16:off + 16 + len(header)]
+                parsed = {}
+                aoff = off + 16 + len(header)
+                while aoff < off + nl_len:
+                    alen, atype = struct.unpack_from('=HH', data, aoff)
+                    parsed[atype] = data[aoff + 4:aoff + alen]
+                    aoff += (alen + 3) & ~3
+                replies.append((hdr, parsed))
+                off += (nl_len + 3) & ~3
+
+
+def _as_nobody(func):
+    """Run func() as an unprivileged user in a child, return its result."""
+
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        status = 1
+        try:
+            os.setgroups([])
+            os.setresgid(65534, 65534, 65534)
+            os.setresuid(65534, 65534, 65534)
+            os.write(wfd, json.dumps(func()).encode())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(wfd)
+    with os.fdopen(rfd) as f:
+        result = f.read()
+    _, status = os.waitpid(pid, 0)
+    ksft_eq(status, 0, "unprivileged request failed")
+    return json.loads(result) if status == 0 else None
+
+
+RTM_NEWPREFIX = 52
+RTM_DELPREFIX = 53
+RTM_GETPREFIX = 54
+PREFIX_ADDRESS = 1
+PREFIX_CACHEINFO = 2
+PREFIX_ROUTER = 3
+ND_OPT_PREFIX_INFO = 3
+
+
+def _prefix_change(msg_type, ifindex, prefix, plen, router, valid=None,
+                   flags=0):
+    header = struct.pack('=BBHiBBBB', socket.AF_INET6, 0, 0, ifindex,
+                         ND_OPT_PREFIX_INFO, plen, 0xc0, 0)
+    attrs = _nlattr(PREFIX_ADDRESS, _in6(prefix))
+    attrs += _nlattr(PREFIX_ROUTER, _in6(router))
+    if valid is not None:
+        attrs += _nlattr(PREFIX_CACHEINFO, struct.pack('=II', valid, valid))
+    err, _ = _rtnl_request(msg_type, Netlink.NLM_F_ACK | flags, header, attrs)
+    return err
+
+
+def _prefix_dump(ifindex=0):
+    """Return the advertised prefixes as sorted (prefix, router) tuples."""
+
+    header = struct.pack('=BBHiBBBB', socket.AF_INET6, 0, 0, 0, 0, 0, 0, 0)
+    err, replies = _rtnl_request(RTM_GETPREFIX, Netlink.NLM_F_DUMP, header)
+    ksft_eq(err, 0, "RTM_GETPREFIX dump failed")
+    result = []
+    for hdr, attrs in replies:
+        _, _, _, idx, _, plen, _, _ = struct.unpack('=BBHiBBBB', hdr)
+        if ifindex and idx != ifindex:
+            continue
+        result.append((f"{_ntop6(attrs[PREFIX_ADDRESS])}/{plen}",
+                       _ntop6(attrs[PREFIX_ROUTER])))
+    return sorted(result)
+
+
+def ipv6_saddr_adv_prefix_netlink() -> None:
+    """
+    Source address selection prefers an address in a prefix advertised by
+    the next-hop (RFC 6724 rule 5.5), with the advertised prefixes set by
+    userspace with RTM_NEWPREFIX.
+    """
+
+    with NetNS() as ns:
+        ip("link add name dummy1 type dummy", ns=str(ns))
+        with NetNSEnter(str(ns)):
+            _write_ipv6_sysctl("conf/dummy1/accept_dad", 0)
+            ip("link set dev dummy1 up")
+            ifindex = socket.if_nametoindex("dummy1")
+            create = Netlink.NLM_F_CREATE | Netlink.NLM_F_REPLACE
+
+            err = _prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:1::", 64,
+                                 "fe80::1", flags=create)
+            if err == -errno.EOPNOTSUPP:
+                raise KsftSkipEx("kernel does not support RTM_NEWPREFIX")
+            ksft_eq(err, 0)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:2::", 64,
+                                   "fe80::2", valid=600, flags=create), 0)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:2::", 64,
+                                   "fe80::4", flags=create), 0)
+            ksft_eq(_prefix_dump(ifindex),
+                    [("2001:db8:1::/64", "fe80::1"),
+                     ("2001:db8:2::/64", "fe80::2"),
+                     ("2001:db8:2::/64", "fe80::4")])
+
+            # Like other rtnetlink objects
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:1::", 64,
+                                   "fe80::1", flags=Netlink.NLM_F_CREATE),
+                    -errno.EEXIST)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:3::", 64,
+                                   "fe80::1", flags=Netlink.NLM_F_REPLACE),
+                    -errno.ENOENT)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:3::", 64,
+                                   "2001:db8::1", flags=create), -errno.EINVAL)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:3::", 64,
+                                   "fe80::1", valid=0, flags=create),
+                    -errno.EINVAL)
+
+            ip("-6 address add 2001:db8:1::1/64 dev dummy1")
+            ip("-6 address add 2001:db8:2::1/64 dev dummy1")
+
+            # 2001:db8:1::1 has the longest matching prefix with both
+            # destinations (rule 8), but rule 5.5 comes first.
+            ip("-6 route add 2001:db8:1:ff00::/56 via fe80::2 dev dummy1")
+            ip("-6 route add 2001:db8:1:fe00::/56 via fe80::3 dev dummy1")
+
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), "2001:db8:2::1")
+            ksft_eq(_route_get_saddr("2001:db8:1:ff00::1"), "2001:db8:2::1")
+            ksft_eq(_saddr("2001:db8:1:fe00::1"), "2001:db8:1::1")
+            ksft_eq(_route_get_saddr("2001:db8:1:fe00::1"), "2001:db8:1::1")
+
+            # Unprivileged users can read the table, but not change it.
+            dump = _as_nobody(lambda: _prefix_dump(ifindex))
+            ksft_eq([tuple(e) for e in dump], _prefix_dump(ifindex))
+            ksft_eq(_as_nobody(lambda: _prefix_change(
+                RTM_DELPREFIX, ifindex, "2001:db8:2::", 64, "fe80::2")),
+                    -errno.EPERM)
+
+            ksft_eq(_prefix_change(RTM_DELPREFIX, ifindex, "2001:db8:2::", 64,
+                                   "fe80::2"), 0)
+            ksft_eq(_prefix_change(RTM_DELPREFIX, ifindex, "2001:db8:2::", 64,
+                                   "fe80::2"), -errno.ENOENT)
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), "2001:db8:1::1")
+
+            # Entries expire.
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, ifindex, "2001:db8:2::", 64,
+                                   "fe80::2", valid=1, flags=create), 0)
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), "2001:db8:2::1")
+            time.sleep(1.5)
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), "2001:db8:1::1")
+            ksft_not_in(("2001:db8:2::/64", "fe80::2"), _prefix_dump(ifindex))
+
+            # The table is flushed when the interface goes down.
+            ip("link set dev dummy1 down")
+            ksft_eq(_prefix_dump(ifindex), [])
+
+
+def _ra_sock_from(ns_r, ifname, router):
+    """Raw ICMPv6 socket sending from the link-local address router."""
+
+    sock, ifindex = _ra_router_sock(ns_r, ifname)
+    sock.bind((router, 0, 0, ifindex))
+    return sock, ifindex
+
+
+def _wait_addr(prefix, deadline=10):
+    """Return the address in prefix/64, waiting for SLAAC."""
+
+    end = time.time() + deadline
+    while time.time() < end:
+        for entry in ip("-6 address show", json=True):
+            for addr in entry.get('addr_info', []):
+                if _in6(addr['local'])[:8] == _in6(prefix)[:8]:
+                    return addr['local']
+        time.sleep(0.1)
+    return None
+
+
+def ipv6_saddr_adv_prefix_ra() -> None:
+    """
+    The kernel remembers which router advertised which prefix in Prefix
+    Information options, and source address selection prefers an address in
+    a prefix advertised by the next-hop (RFC 6724 rule 5.5).
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        ip(f"link add veth0 netns {ns_h} type veth peer name veth1 netns {ns_r}")
+        with NetNSEnter(str(ns_h)):
+            _write_ipv6_sysctl("conf/veth0/accept_dad", 0)
+            _write_ipv6_sysctl("conf/veth0/accept_ra", 2)
+            _write_ipv6_sysctl("conf/veth0/forwarding", 0)
+        ip("link set dev veth0 up", ns=str(ns_h))
+        ip("link set dev veth1 up", ns=str(ns_r))
+        # Two routers on the same link.
+        ip("-6 address add fe80::1/64 dev veth1 nodad", ns=str(ns_r))
+        ip("-6 address add fe80::2/64 dev veth1 nodad", ns=str(ns_r))
+
+        sock1, ifindex = _ra_sock_from(ns_r, "veth1", "fe80::1")
+        sock2, _ = _ra_sock_from(ns_r, "veth1", "fe80::2")
+
+        # A and L flags set, router lifetime 0, i.e. not default routers.
+        _send_ra(sock1, ifindex, 0, pio=('2001:db8:1::', 64, 600),
+                 pio_flags=0xc0)
+        _send_ra(sock2, ifindex, 0, pio=('2001:db8:2::', 64, 600),
+                 pio_flags=0xc0)
+
+        with NetNSEnter(str(ns_h)):
+            a1 = _wait_addr('2001:db8:1::')
+            a2 = _wait_addr('2001:db8:2::')
+            ksft_not_none(a1, "no address from the PIO of fe80::1")
+            ksft_not_none(a2, "no address from the PIO of fe80::2")
+            if a1 is None or a2 is None:
+                return
+
+            prefixes = _prefix_dump(socket.if_nametoindex("veth0"))
+            if not prefixes:
+                raise KsftSkipEx("kernel does not track advertised prefixes")
+            ksft_eq(prefixes, [("2001:db8:1::/64", "fe80::1"),
+                               ("2001:db8:2::/64", "fe80::2")])
+
+            ip("-6 route add 2001:db8:1:ff00::/56 via fe80::2 dev veth0")
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), a2)
+
+            # The second router also advertises the first prefix.
+            _send_ra(sock2, ifindex, 0, pio=('2001:db8:1::', 64, 600),
+                     pio_flags=0xc0)
+            ksft_busy_wait(lambda: ("2001:db8:1::/64", "fe80::2") in _prefix_dump(),
+                           deadline=5, comment="fe80::2 did not advertise 2001:db8:1::/64")
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), a1)
+
+            # A zero valid lifetime withdraws the prefix of that router, even
+            # though the address itself stays (RFC 4862 section 5.5.3 e).
+            _send_ra(sock2, ifindex, 0, pio=('2001:db8:1::', 64, 0),
+                     pio_flags=0xc0)
+            ksft_busy_wait(lambda: ("2001:db8:1::/64", "fe80::2") not in _prefix_dump(),
+                           deadline=5, comment="2001:db8:1::/64 of fe80::2 not withdrawn")
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), a2)
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, ipv4_devconf_notify,
               ipv6_route_del_reason_expired,
               ipv6_route_del_reason_ra_withdrawn,
-              ipv6_route_del_reason_absent])
+              ipv6_route_del_reason_absent,
+              ipv6_saddr_adv_prefix_netlink,
+              ipv6_saddr_adv_prefix_ra])
     ksft_exit()
 
 if __name__ == "__main__":
