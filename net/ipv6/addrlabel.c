@@ -198,12 +198,15 @@ static int __ip6addrlbl_add(struct net *net, struct ip6addrlbl_entry *newp,
 			    int replace)
 {
 	struct ip6addrlbl_entry *last = NULL, *p = NULL;
-	struct hlist_node *n;
 	int ret = 0;
 
 	net_dbg_ratelimited("%s(newp=%p, replace=%d)\n", __func__, newp, replace);
 
-	hlist_for_each_entry_safe(p, n,	&net->ipv6.ip6addrlbl_table.head, list) {
+	/* An entry with the same key may come after other entries with the
+	 * same prefix length, hence look for it before finding the insertion
+	 * point.
+	 */
+	hlist_for_each_entry(p, &net->ipv6.ip6addrlbl_table.head, list) {
 		if (p->prefixlen == newp->prefixlen &&
 		    p->ifindex == newp->ifindex &&
 		    ipv6_addr_equal(&p->prefix, &newp->prefix)) {
@@ -214,8 +217,12 @@ static int __ip6addrlbl_add(struct net *net, struct ip6addrlbl_entry *newp,
 			hlist_replace_rcu(&p->list, &newp->list);
 			kfree_rcu(p, rcu);
 			goto out;
-		} else if ((p->prefixlen == newp->prefixlen && !p->ifindex) ||
-			   (p->prefixlen < newp->prefixlen)) {
+		}
+	}
+
+	hlist_for_each_entry(p, &net->ipv6.ip6addrlbl_table.head, list) {
+		if ((p->prefixlen == newp->prefixlen && !p->ifindex) ||
+		    (p->prefixlen < newp->prefixlen)) {
 			hlist_add_before_rcu(&newp->list, &p->list);
 			goto out;
 		}
