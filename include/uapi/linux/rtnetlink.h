@@ -92,6 +92,10 @@ enum {
 
 	RTM_NEWPREFIX	= 52,
 #define RTM_NEWPREFIX	RTM_NEWPREFIX
+	RTM_DELPREFIX,
+#define RTM_DELPREFIX	RTM_DELPREFIX
+	RTM_GETPREFIX,
+#define RTM_GETPREFIX	RTM_GETPREFIX
 
 	RTM_NEWMULTICAST = 56,
 #define RTM_NEWMULTICAST RTM_NEWMULTICAST
@@ -617,11 +621,21 @@ struct prefixmsg {
 	unsigned char	prefix_pad3;
 };
 
+/* RTM_NEWPREFIX notifications report Prefix Information options received in
+ * Router Advertisements. In addition, the kernel keeps per interface the
+ * prefixes advertised by each router (RFC 8028), which source address
+ * selection uses to prefer addresses in a prefix advertised by the next-hop
+ * (RFC 6724, rule 5.5). Userspace that processes Router Advertisements itself
+ * manages these entries with RTM_NEWPREFIX and RTM_DELPREFIX, and they are
+ * dumped with RTM_GETPREFIX. Entries are keyed by interface, prefix, prefix
+ * length and router, and expire after PREFIX_CACHEINFO's valid_time.
+ */
 enum 
 {
 	PREFIX_UNSPEC,
 	PREFIX_ADDRESS,
 	PREFIX_CACHEINFO,
+	PREFIX_ROUTER,		/* struct in6_addr, link-local address of the router */
 	__PREFIX_MAX
 };
 
