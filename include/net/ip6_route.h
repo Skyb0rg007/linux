@@ -144,6 +144,7 @@ void rt6_age_exceptions(struct fib6_info *f6i, struct fib6_gc_args *gc_args,
 
 static inline int ip6_route_get_saddr(struct net *net, struct fib6_info *f6i,
 				      const struct in6_addr *daddr,
+				      const struct in6_addr *nexthop,
 				      unsigned int prefs, int l3mdev_index,
 				      struct in6_addr *saddr)
 {
@@ -161,7 +162,9 @@ static inline int ip6_route_get_saddr(struct net *net, struct fib6_info *f6i,
 	if (f6i && f6i->fib6_prefsrc.plen && same_vrf)
 		*saddr = f6i->fib6_prefsrc.addr;
 	else
-		err = ipv6_dev_get_saddr(net, same_vrf ? dev : l3mdev, daddr, prefs, saddr);
+		err = ipv6_dev_get_saddr_nh(net, same_vrf ? dev : l3mdev, daddr,
+					    same_vrf ? nexthop : NULL, prefs,
+					    saddr);
 
 	rcu_read_unlock();
 

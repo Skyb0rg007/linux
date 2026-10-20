@@ -5872,8 +5872,12 @@ static int rt6_fill_node(struct net *net, struct sk_buff *skb,
 			if (nla_put_u32(skb, RTA_IIF, iif))
 				goto nla_put_failure;
 	} else if (dest) {
+		const struct in6_addr *nexthop = NULL;
 		struct in6_addr saddr_buf;
-		if (ip6_route_get_saddr(net, rt, dest, 0, 0, &saddr_buf) == 0 &&
+
+		if (rt6 && (rt6->rt6i_flags & RTF_GATEWAY))
+			nexthop = &rt6->rt6i_gateway;
+		if (ip6_route_get_saddr(net, rt, dest, nexthop, 0, 0, &saddr_buf) == 0 &&
 		    nla_put_in6_addr(skb, RTA_PREFSRC, &saddr_buf))
 			goto nla_put_failure;
 	}

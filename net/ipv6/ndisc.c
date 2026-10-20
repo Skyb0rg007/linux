@@ -1549,7 +1549,8 @@ skip_routeinfo:
 		     p = ndisc_next_option(p, ndopts.nd_opts_pi_end)) {
 			addrconf_prefix_rcv(skb->dev, (u8 *)p,
 					    (p->nd_opt_len) << 3,
-					    ndopts.nd_opts_src_lladdr != NULL);
+					    ndopts.nd_opts_src_lladdr != NULL,
+					    &ipv6_hdr(skb)->saddr);
 		}
 	}
 
