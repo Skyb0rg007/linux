@@ -1401,6 +1401,42 @@ int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 			val |= IPV6_PREFER_SRC_HOME;
 		break;
 		}
+
+	case IPV6_ADDR_SELECTION:
+	{
+		struct ipv6_addr_selection sel;
+		struct in6_addr saddr, daddr;
+		struct net_device *dev;
+		struct dst_entry *dst;
+
+		if (len < 0)
+			return -EINVAL;
+
+		sockopt_lock_sock(sk);
+		saddr = sk->sk_v6_rcv_saddr;
+		daddr = sk->sk_v6_daddr;
+		sockopt_release_sock(sk);
+		if (ipv6_addr_any(&daddr) || ipv6_addr_any(&saddr))
+			return -ENOTCONN;
+
+		rcu_read_lock();
+		dst = __sk_dst_get(sk);
+		if (dst)
+			dev = dst_dev_rcu(dst);
+		else
+			dev = dev_get_by_index_rcu(sock_net(sk),
+						   READ_ONCE(sk->sk_bound_dev_if));
+		ipv6_addr_sel_info(sock_net(sk), dev, &saddr, &daddr, &sel);
+		rcu_read_unlock();
+
+		len = min_t(unsigned int, sizeof(sel), len);
+		if (copy_to_sockptr(optlen, &len, sizeof(int)))
+			return -EFAULT;
+		if (copy_to_sockptr(optval, &sel, len))
+			return -EFAULT;
+		return 0;
+	}
+
 	case IPV6_MINHOPCOUNT:
 		val = READ_ONCE(np->min_hopcount);
 		break;

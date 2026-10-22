@@ -291,6 +291,22 @@ struct in6_flowlabel_req {
 #define IPV6_RECVFRAGSIZE	77
 #define IPV6_FREEBIND		78
 
+/* RFC 6724: Destination address selection, read only */
+#define IPV6_ADDR_SELECTION	79
+
+struct ipv6_addr_selection {
+	__u32	ias_flags;		/* IPV6_ADDR_SEL_* */
+	__u32	ias_src_label;		/* Label(Source(D)) */
+	__u32	ias_dst_label;		/* Label(D) */
+	__u32	ias_dst_precedence;	/* Precedence(D) */
+	__u8	ias_src_prefixlen;	/* prefix length of Source(D) */
+	__u8	__ias_reserved[3];
+};
+
+#define IPV6_ADDR_SEL_SRC_DEPRECATED	0x0001
+#define IPV6_ADDR_SEL_SRC_HOME		0x0002
+#define IPV6_ADDR_SEL_DST_NO_PRECEDENCE	0x0004	/* ias_dst_precedence is 0 */
+
 /*
  * Multicast Routing:
  * see include/uapi/linux/mroute6.h.

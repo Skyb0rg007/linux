@@ -146,6 +146,10 @@ int ipv6_dev_get_saddr_nh(struct net *net, const struct net_device *dev,
 			  const struct in6_addr *daddr,
 			  const struct in6_addr *nexthop,
 			  unsigned int srcprefs, struct in6_addr *saddr);
+void ipv6_addr_sel_info(struct net *net, struct net_device *dst_dev,
+			const struct in6_addr *saddr,
+			const struct in6_addr *daddr,
+			struct ipv6_addr_selection *sel);
 int ipv6_get_lladdr(struct net_device *dev, struct in6_addr *addr,
 		    u32 banned_flags);
 bool inet_rcv_saddr_equal(const struct sock *sk, const struct sock *sk2,
@@ -241,6 +245,8 @@ void ipv6_addr_label_cleanup(void);
 int ipv6_addr_label_rtnl_register(void);
 u32 ipv6_addr_label(struct net *net, const struct in6_addr *addr,
 		    int type, int ifindex);
+u32 ipv6_addr_precedence(struct net *net, const struct in6_addr *addr,
+			 int type, int ifindex, bool *found);
 
 /*
  *	multicast prototypes (mcast.c)
