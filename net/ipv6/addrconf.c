@@ -1552,6 +1552,7 @@ static void inet6_adv_prefix_del(struct inet6_dev *idev,
 
 	hlist_del_rcu(&p->node);
 	idev->adv_prefixes_count--;
+	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
 	inet6_adv_prefix_notify(idev, p, RTM_DELPREFIX, nlh, portid);
 	kfree_rcu(p, rcu);
 }
@@ -1649,6 +1650,7 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 
 		hlist_add_head_rcu(&new->node, &idev->adv_prefixes);
 		idev->adv_prefixes_count++;
+		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes);
 	}
 	if (notify)
 		inet6_adv_prefix_notify(idev, new, RTM_NEWPREFIX, nlh, portid);
@@ -4908,6 +4910,10 @@ static void addrconf_verify_adv_prefixes(struct net *net, unsigned long *next)
 	struct inet6_adv_prefix *p;
 	struct net_device *dev;
 	struct hlist_node *n;
+
+	/* Most namespaces have none, but may have many devices. */
+	if (!atomic_read(&net->ipv6.adv_prefixes))
+		return;
 
 	for_each_netdev(net, dev) {
 		struct inet6_dev *idev = __in6_dev_get(dev);
