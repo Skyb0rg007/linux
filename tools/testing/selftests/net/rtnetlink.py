@@ -1001,6 +1001,117 @@ def ipv6_saddr_adv_prefix_ra() -> None:
             ksft_in(("2001:db8:1::/64", "fe80::2"), _prefix_dump(veth0))
 
 
+def ipv6_saddr_adv_prefix_icmp() -> None:
+    """
+    ICMPv6 errors about forwarded packets prefer a source address in a
+    prefix advertised by the next-hop (RFC 6724 rule 5.5).
+    """
+
+    with NetNS() as ns_a, NetNS() as ns_n:
+        ip(f"link add a0 netns {ns_a} type veth peer name n0 netns {ns_n}")
+        with NetNSEnter(str(ns_n)):
+            _write_ipv6_sysctl("conf/all/forwarding", 1)
+            _write_ipv6_sysctl("conf/n0/accept_dad", 0)
+            _write_ipv6_sysctl("icmp/ratelimit", 0)
+            ip("link add name dummy1 type dummy")
+            ip("link set dev dummy1 up")
+            ip("link set dev n0 up")
+            ip("-6 address add fe80::1/64 dev n0 nodad")
+            ip("-6 address add 2001:db8:1::1/64 dev n0 nodad")
+            ip("-6 address add 2001:db8:2::1/64 dev n0 nodad")
+            ip("-6 route add 2001:db8:5::/64 dev dummy1")
+            # 2001:db8:1::1 has the longest matching prefix (rule 8), but
+            # another router advertised it.
+            ip("-6 route add 2001:db8:1:ff00::/56 via fe80::a dev n0")
+            err = _prefix_change(RTM_NEWPREFIX, socket.if_nametoindex("n0"),
+                                 "2001:db8:2::", 64, "fe80::a",
+                                 flags=Netlink.NLM_F_CREATE)
+            if err == -errno.EOPNOTSUPP:
+                raise KsftSkipEx("kernel does not support RTM_NEWPREFIX")
+            ksft_eq(err, 0)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX, socket.if_nametoindex("n0"),
+                                   "2001:db8:1::", 64, "fe80::b",
+                                   flags=Netlink.NLM_F_CREATE), 0)
+
+        with NetNSEnter(str(ns_a)):
+            _write_ipv6_sysctl("conf/a0/accept_dad", 0)
+            ip("link set dev a0 up")
+            ip("-6 address add fe80::a/64 dev a0 nodad")
+            ip("-6 address add 2001:db8:1:ff00::a/128 dev a0 nodad")
+            ip("-6 route add 2001:db8:5::/64 via fe80::1 dev a0")
+
+            def time_exceeded_from():
+                with socket.socket(socket.AF_INET6, socket.SOCK_RAW,
+                                   socket.IPPROTO_ICMPV6) as icmp, \
+                     socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as udp:
+                    icmp.settimeout(5)
+                    udp.bind(("2001:db8:1:ff00::a", 0))
+                    udp.setsockopt(socket.IPPROTO_IPV6,
+                                   socket.IPV6_UNICAST_HOPS, 1)
+                    udp.sendto(b"x", ("2001:db8:5::1", 9))
+                    while True:
+                        data, addr = icmp.recvfrom(1500)
+                        if data[0] == 3:	# Time Exceeded
+                            return addr[0]
+
+            ksft_eq(time_exceeded_from(), "2001:db8:2::1")
+            with NetNSEnter(str(ns_n)):
+                _write_ipv6_sysctl("conf/n0/use_nexthop_prefixes", 0)
+            ksft_eq(time_exceeded_from(), "2001:db8:1::1")
+
+
+RTM_NEWRULE = 32
+FRA_SRC = 2
+FRA_PRIORITY = 6
+FRA_TABLE = 15
+FR_ACT_TO_TBL = 1
+FIB_RULE_FIND_SADDR = 0x00010000
+
+
+def ipv6_saddr_adv_prefix_rule() -> None:
+    """
+    A rule that matches the source address selects it with RFC 6724 rule
+    5.5, like the source address of the route the rule leads to.
+    """
+
+    with NetNS() as ns:
+        ip("link add name dummy1 type dummy", ns=str(ns))
+        with NetNSEnter(str(ns)):
+            _write_ipv6_sysctl("conf/dummy1/accept_dad", 0)
+            ip("link set dev dummy1 up")
+            ip("-6 address add 2001:db8:1::1/64 dev dummy1")
+            ip("-6 address add 2001:db8:2::1/64 dev dummy1")
+            err = _prefix_change(RTM_NEWPREFIX, socket.if_nametoindex("dummy1"),
+                                 "2001:db8:2::", 64, "fe80::2",
+                                 flags=Netlink.NLM_F_CREATE)
+            if err == -errno.EOPNOTSUPP:
+                raise KsftSkipEx("kernel does not support RTM_NEWPREFIX")
+            ksft_eq(err, 0)
+            ksft_eq(_prefix_change(RTM_NEWPREFIX,
+                                   socket.if_nametoindex("dummy1"),
+                                   "2001:db8:1::", 64, "fe80::3",
+                                   flags=Netlink.NLM_F_CREATE), 0)
+
+            ip("-6 route add 2001:db8:1:ff00::/56 via fe80::2 dev dummy1 table 100")
+            ip("-6 route add 2001:db8:1:ff00::/56 via fe80::3 dev dummy1")
+
+            # "from 2001:db8:2::/64 lookup 100", matched against the source
+            # address selected for the route of table 100.
+            header = struct.pack('=BBBBBBBBI', socket.AF_INET6, 0, 64, 0, 0,
+                                 0, 0, FR_ACT_TO_TBL, FIB_RULE_FIND_SADDR)
+            attrs = _nlattr(FRA_SRC, _in6("2001:db8:2::"))
+            attrs += _nlattr(FRA_TABLE, struct.pack('=I', 100))
+            attrs += _nlattr(FRA_PRIORITY, struct.pack('=I', 100))
+            err, _ = _rtnl_request(RTM_NEWRULE, Netlink.NLM_F_ACK |
+                                   Netlink.NLM_F_CREATE, header, attrs)
+            ksft_eq(err, 0)
+
+            ksft_eq(_saddr("2001:db8:1:ff00::1"), "2001:db8:2::1")
+            route = ip("-6 route get 2001:db8:1:ff00::1", json=True)[0]
+            ksft_eq((route.get('gateway'), route.get('prefsrc')),
+                    ("fe80::2", "2001:db8:2::1"))
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, dump_mcaddr_l2_check,
               ipv4_devconf_notify,
@@ -1012,7 +1123,9 @@ def main() -> None:
               ipv6_saddr_adv_prefix_netlink,
               ipv6_saddr_adv_prefix_notify,
               ipv6_saddr_adv_prefix_subnet,
-              ipv6_saddr_adv_prefix_ra])
+              ipv6_saddr_adv_prefix_ra,
+              ipv6_saddr_adv_prefix_icmp,
+              ipv6_saddr_adv_prefix_rule])
     ksft_exit()
 
 if __name__ == "__main__":
