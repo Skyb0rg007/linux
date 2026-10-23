@@ -45,6 +45,11 @@ enum {
 
 #define MAX_RTR_SOLICITATION_DELAY	HZ
 
+/* Flags field of Router Advertisements, from IANA "IPv6 ND Router
+ * Advertisement flags"
+ */
+#define ND_RA_FLAG_SNAC			0x02	/* SNAC router, flag 6 */
+
 #define ND_REACHABLE_TIME		(30*HZ)
 #define ND_RETRANS_TIMER		HZ
 

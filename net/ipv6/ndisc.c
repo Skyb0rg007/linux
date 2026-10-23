@@ -1253,6 +1253,7 @@ errout:
 static enum skb_drop_reason ndisc_router_discovery(struct sk_buff *skb)
 {
 	struct ra_msg *ra_msg = (struct ra_msg *)skb_transport_header(skb);
+	u8 ra_flags = ra_msg->icmph.icmp6_dataun.un_data8[1];
 	struct net *net = dev_net(skb->dev);
 	bool send_ifinfo_notify = false;
 	struct neighbour *neigh = NULL;
@@ -1575,7 +1576,7 @@ skip_routeinfo:
 			addrconf_prefix_rcv(skb->dev, (u8 *)p,
 					    (p->nd_opt_len) << 3,
 					    ndopts.nd_opts_src_lladdr != NULL,
-					    &ipv6_hdr(skb)->saddr);
+					    &ipv6_hdr(skb)->saddr, ra_flags);
 		}
 	}
 
