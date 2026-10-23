@@ -25,8 +25,15 @@ struct ifaddrlblmsg {
 enum {
 	IFAL_ADDRESS = 1,
 	IFAL_LABEL = 2,
+	IFAL_PRECEDENCE = 3,	/* u32, RFC 6724 precedence */
 	__IFAL_MAX
 };
+
+/* IFAL_PRECEDENCE is optional, up to 0xfffffffe. An entry for all interfaces
+ * (ifal_index 0) added without it for a prefix of the default policy table
+ * gets the default precedence of that prefix, other entries get none, which
+ * is dumped without the attribute.
+ */
 
 #define IFAL_MAX	(__IFAL_MAX - 1)
 
