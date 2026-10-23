@@ -731,8 +731,16 @@ struct nduseroptmsg {
 enum {
 	NDUSEROPT_UNSPEC,
 	NDUSEROPT_SRCADDR,
+	NDUSEROPT_RA_FLAGS,	/* u8 */
 	__NDUSEROPT_MAX
 };
+
+/* NDUSEROPT_RA_FLAGS is the flags field of the Router Advertisement that
+ * carried the option, as in the message, i.e. flags 0 to 7 of the IANA
+ * "IPv6 ND Router Advertisement flags" registry from the most significant
+ * bit: 0x80 is M, 0x40 is O, 0x18 is the 2-bit Prf, and 0x02 is the SNAC
+ * Router flag (S), for example.
+ */
 
 #define NDUSEROPT_MAX	(__NDUSEROPT_MAX - 1)
 
