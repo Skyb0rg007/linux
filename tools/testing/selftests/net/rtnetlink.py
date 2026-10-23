@@ -202,7 +202,7 @@ def ipv6_route_del_reason_expired() -> None:
 
 
 def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80,
-             ra_flags=0):
+             ra_flags=0, rios=(), pios=()):
     """
     The kernel fills in the ICMPv6 checksum on raw ICMPv6 sockets.
     The PIO is on-link only (L set, A clear) unless pio_flags says otherwise.
@@ -211,16 +211,15 @@ def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80,
     # type, code, cksum, hop limit, flags, router lifetime,
     # reachable time, retrans timer
     ra = struct.pack('!BBHBBHII', 134, 0, 0, 64, ra_flags, lifetime, 0, 0)
-    if rio is not None:
-        prefix, plen, rio_lifetime = rio
+    for prefix, plen, rio_lifetime in ([rio] if rio else []) + list(rios):
         # RFC 4191 route information option, /64 prefix (8 bytes)
         ra += struct.pack('!BBBBI', 24, 2, plen, 0, rio_lifetime)
         ra += socket.inet_pton(socket.AF_INET6, prefix)[:8]
-    if pio is not None:
-        prefix, plen, valid_lft = pio
+    for prefix, plen, valid_lft, *opt_flags in ([pio] if pio else []) + list(pios):
         # RFC 4861 prefix information option
-        ra += struct.pack('!BBBBIII', 3, 4, plen, pio_flags, valid_lft,
-                          valid_lft, 0)
+        ra += struct.pack('!BBBBIII', 3, 4, plen,
+                          opt_flags[0] if opt_flags else pio_flags,
+                          valid_lft, valid_lft, 0)
         ra += socket.inet_pton(socket.AF_INET6, prefix)
     sock.sendto(ra, ('ff02::1', 0, 0, ifindex))
 
@@ -456,6 +455,7 @@ PREFIX_ADDRESS = 1
 PREFIX_CACHEINFO = 2
 PREFIX_ROUTER = 3
 PREFIX_PROTO = 4
+PREFIX_RA_FLAGS = 5
 ND_OPT_PREFIX_INFO = 3
 ND_OPT_ROUTE_INFO = 24
 RTNLGRP_IPV6_ADV_PREFIX = 40
@@ -465,15 +465,18 @@ PREFIXMSG_LEN = 12
 
 
 def _prefix_change(msg_type, ifindex, prefix, plen, router, valid=None,
-                   flags=0, proto=None):
+                   flags=0, proto=None, ptype=ND_OPT_PREFIX_INFO,
+                   ra_flags=None):
     header = struct.pack('=BBHiBBBB', socket.AF_INET6, 0, 0, ifindex,
-                         ND_OPT_PREFIX_INFO, plen, 0xc0, 0)
+                         ptype, plen, 0xc0, 0)
     attrs = _nlattr(PREFIX_ADDRESS, _in6(prefix))
     attrs += _nlattr(PREFIX_ROUTER, _in6(router))
     if valid is not None:
         attrs += _nlattr(PREFIX_CACHEINFO, struct.pack('=II', valid, valid))
     if proto is not None:
         attrs += _nlattr(PREFIX_PROTO, struct.pack('=B', proto))
+    if ra_flags is not None:
+        attrs += _nlattr(PREFIX_RA_FLAGS, struct.pack('=B', ra_flags))
     err, _ = _rtnl_request(msg_type, Netlink.NLM_F_ACK | flags, header, attrs)
     return err
 
@@ -484,7 +487,9 @@ def _prefix_entry(hdr, attrs):
     return {'ifindex': ifindex, 'type': ptype, 'valid': valid,
             'prefix': f"{_ntop6(attrs[PREFIX_ADDRESS])}/{plen}",
             'router': _ntop6(attrs[PREFIX_ROUTER]),
-            'proto': attrs[PREFIX_PROTO][0] if PREFIX_PROTO in attrs else 0}
+            'proto': attrs[PREFIX_PROTO][0] if PREFIX_PROTO in attrs else 0,
+            'ra_flags': attrs[PREFIX_RA_FLAGS][0]
+                        if PREFIX_RA_FLAGS in attrs else None}
 
 
 def _prefix_entries(ifindex=0, ptype=0, strict=False):
@@ -571,7 +576,9 @@ def ipv6_saddr_adv_prefix_netlink() -> None:
                     ["2001:db8:1::/64", "2001:db8:2::/64", "2001:db8:2::/64"])
             ksft_eq(len(_prefix_entries(ifindex, ND_OPT_PREFIX_INFO,
                                         strict=True)), 3)
-            ksft_eq(_prefix_entries(ifindex, 24, strict=True), -errno.EINVAL)
+            ksft_eq(_prefix_entries(ifindex, ND_OPT_ROUTE_INFO, strict=True),
+                    [])
+            ksft_eq(_prefix_entries(ifindex, 25, strict=True), -errno.EINVAL)
             entries = _prefix_entries(socket.if_nametoindex("dummy2"),
                                       strict=True)
             ksft_eq([(e['prefix'], e['proto'], e['valid'], e['type'])
@@ -1064,7 +1071,7 @@ def _addrlabel_change(msg_type, prefix, plen, label, precedence=None, flags=0,
 
 
 def _addrlabel_entry(hdr, attrs):
-    _, _, plen, _, ifindex, _ = struct.unpack('=BBBBII', hdr)
+    _, _, plen, flags, ifindex, _ = struct.unpack('=BBBBII', hdr)
     entry = {'prefix': f"{_ntop6(attrs[IFAL_ADDRESS])}/{plen}",
              'label': struct.unpack('=I', attrs[IFAL_LABEL])[0],
              'ifindex': ifindex}
@@ -1072,6 +1079,8 @@ def _addrlabel_entry(hdr, attrs):
         entry['precedence'] = struct.unpack('=I', attrs[IFAL_PRECEDENCE])[0]
     if IFAL_PROTOCOL in attrs:
         entry['proto'] = attrs[IFAL_PROTOCOL][0]
+    if flags:
+        entry['flags'] = flags
     return entry
 
 
@@ -1316,6 +1325,281 @@ def ipv6_addr_selection() -> None:
             ksft_eq(_addr_selection("2001:db8:1::2")['flags'],
                     IPV6_ADDR_SEL_SRC_DEPRECATED | IPV6_ADDR_SEL_SRC_HOME)
 
+ND_RA_FLAG_SNAC = 0x02
+
+
+def _ra_host(ns_h, ns_r, routers, **sysctls):
+    """
+    Connect a host to routers sending from the given link-local addresses,
+    return their sockets and the ifindex of the host side.
+    """
+
+    ip(f"link add veth0 netns {ns_h} type veth peer name veth1 netns {ns_r}")
+    with NetNSEnter(str(ns_h)):
+        _write_ipv6_sysctl("conf/veth0/accept_dad", 0)
+        _write_ipv6_sysctl("conf/veth0/accept_ra", 2)
+        _write_ipv6_sysctl("conf/veth0/accept_ra_rt_info_max_plen", 64)
+        for name, value in sysctls.items():
+            _write_ipv6_sysctl(name, value)
+    ip("link set dev veth0 up", ns=str(ns_h))
+    ip("link set dev veth1 up", ns=str(ns_r))
+    socks = []
+    for router in routers:
+        ip(f"-6 address add {router}/64 dev veth1 nodad", ns=str(ns_r))
+        sock, ifindex = _ra_sock_from(ns_r, "veth1", router)
+        socks.append(sock)
+    with NetNSEnter(str(ns_h)):
+        veth0 = socket.if_nametoindex("veth0")
+    return socks, ifindex, veth0
+
+
+def ipv6_adv_prefix_rio() -> None:
+    """
+    The kernel also remembers the Route Information options that the
+    interface accepts, and the flags of the Router Advertisements, e.g. the
+    SNAC Router flag, for draft-ietf-6man-rfc6724-update.
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        (sock,), ifindex, veth0 = _ra_host(ns_h, ns_r, ["fe80::1"])
+        _send_ra(sock, ifindex, 0, ra_flags=ND_RA_FLAG_SNAC,
+                 rio=('fd00:2::', 48, 600), pio=('fd00:1::', 64, 600))
+
+        with NetNSEnter(str(ns_h)):
+            def entries():
+                return sorted((e['type'], e['prefix'], e['ra_flags'])
+                              for e in _prefix_entries(veth0))
+            ksft_busy_wait(lambda: len(entries()) == 2, deadline=5,
+                           comment="RIO and PIO not recorded")
+            if entries() and entries()[0][2] is None:
+                raise KsftSkipEx("kernel does not record the RA flags")
+            ksft_eq(entries(), [(ND_OPT_PREFIX_INFO, "fd00:1::/64",
+                                 ND_RA_FLAG_SNAC),
+                                (ND_OPT_ROUTE_INFO, "fd00:2::/48",
+                                 ND_RA_FLAG_SNAC)])
+            ksft_eq([e['prefix'] for e in
+                     _prefix_entries(veth0, ND_OPT_ROUTE_INFO, strict=True)],
+                    ["fd00:2::/48"])
+
+            # RIOs do not count for rule 5.5: the longest match wins.
+            ip("-6 address add fd00:2::1/64 dev veth0")
+            ip("-6 address add fd00:3::1/64 dev veth0")
+            ip("-6 route add fd00:3:ffff::/64 via fe80::1 dev veth0")
+            ksft_eq(_saddr("fd00:3:ffff::1"), "fd00:3::1")
+
+        # The RA flags are updated, and a zero lifetime removes the RIO.
+        _send_ra(sock, ifindex, 0, rio=('fd00:2::', 48, 0),
+                 pio=('fd00:1::', 64, 600))
+        with NetNSEnter(str(ns_h)):
+            ksft_busy_wait(lambda: entries() == [(ND_OPT_PREFIX_INFO,
+                                                  "fd00:1::/64", 0)],
+                           deadline=5, comment="RIO not withdrawn")
+
+        # RIOs are counted apart, they do not keep PIOs out.
+        rios = [(f"fd00:4:{i:x}::", 64, 600) for i in range(40)]
+        _send_ra(sock, ifindex, 0, rios=rios)
+        _send_ra(sock, ifindex, 0, pio=('2001:db8:1::', 64, 600))
+        with NetNSEnter(str(ns_h)):
+            ksft_busy_wait(lambda: ("2001:db8:1::/64", "fe80::1") in
+                           _prefix_dump(veth0), deadline=5,
+                           comment="PIO not recorded after many RIOs")
+            ksft_eq(len(_prefix_entries(veth0, ND_OPT_ROUTE_INFO,
+                                        strict=True)), 32)
+
+            # Userspace sets RIOs and RA flags too, within the limit.
+            def add_rio():
+                return _prefix_change(RTM_NEWPREFIX, veth0, "fd00:5::", 48,
+                                      "fe80::2", flags=Netlink.NLM_F_CREATE,
+                                      ptype=ND_OPT_ROUTE_INFO,
+                                      ra_flags=ND_RA_FLAG_SNAC)
+            ksft_eq(add_rio(), -errno.ENOSPC)
+            ksft_eq(_prefix_change(RTM_DELPREFIX, veth0, "fd00:4::", 64,
+                                   "fe80::1", ptype=ND_OPT_ROUTE_INFO), 0)
+            ksft_eq(add_rio(), 0)
+            ksft_in((ND_OPT_ROUTE_INFO, "fd00:5::/48", ND_RA_FLAG_SNAC),
+                    entries())
+            ksft_eq(_prefix_change(RTM_DELPREFIX, veth0, "fd00:5::", 48,
+                                   "fe80::2", ptype=ND_OPT_ROUTE_INFO), 0)
+
+
+IFAL_F_KNOWN_LOCAL = 0x01
+
+
+def _kl_rows(ifindex):
+    """The known-local entries of ifindex, as {prefix: (label, precedence)}."""
+
+    return {prefix: (e['label'], e.get('precedence'))
+            for prefix, e in _addrlabel_dump(ifindex).items()
+            if e.get('flags', 0) & IFAL_F_KNOWN_LOCAL}
+
+
+def _kl_wait(ifindex, prefixes, comment):
+    ksft_busy_wait(lambda: sorted(_kl_rows(ifindex)) == sorted(prefixes),
+                   deadline=5, comment=comment)
+    ksft_eq(sorted(_kl_rows(ifindex)), sorted(prefixes))
+
+
+def ipv6_addrlabel_known_local() -> None:
+    """
+    With known_local_ula, the kernel adds the known-local ULA prefixes of an
+    interface to the policy table (draft-ietf-6man-rfc6724-update 3.3).
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        try:
+            with NetNSEnter(str(ns_h)):
+                _write_ipv6_sysctl("conf/all/known_local_ula", 1)
+                _write_ipv6_sysctl("conf/default/known_local_ula", 1)
+        except OSError as e:
+            raise KsftSkipEx("kernel does not support known_local_ula") from e
+
+        socks, ifindex, veth0 = _ra_host(ns_h, ns_r,
+                                         ["fe80::1", "fe80::2", "fe80::3"])
+        sock1, sock2, sock3 = socks
+        with NetNSEnter(str(ns_h)):
+            ip("-6 address add fdaa:0:0:1::1/64 dev veth0")
+
+        # A RIO, and a PIO from a SNAC router (rule 1), whose addresses
+        # do not count either (rule 5).
+        _send_ra(sock1, ifindex, 0, rio=('fdbb::', 48, 600))
+        _send_ra(sock2, ifindex, 0, ra_flags=ND_RA_FLAG_SNAC,
+                 pio=('fdb0::', 64, 600), pio_flags=0xc0)
+        with NetNSEnter(str(ns_h)):
+            fdb0 = _wait_addr('fdb0::')
+            ksft_not_none(fdb0, "no address from the PIO of the SNAC router")
+            _kl_wait(veth0, ["fdaa::/48", "fdbb::/48"], "RIO or address")
+            ksft_eq(_kl_rows(veth0)["fdbb::/48"], (14, 45))
+            ksft_eq(_addrlabel_dump(veth0)["fdbb::/48"]['proto'],
+                    RTPROT_KERNEL)
+
+            # The known-local source is selected, not the longest match.
+            ksft_eq(_saddr("fdbb::1"), "fdaa:0:0:1::1")
+            sel = _addr_selection("fdbb::1")
+            ksft_eq((sel['src_label'], sel['dst_label'], sel['precedence']),
+                    (14, 14, 45))
+
+        # The same prefix from a router that is not a SNAC router counts.
+        _send_ra(sock3, ifindex, 0, pio=('fdb0::', 64, 600), pio_flags=0x80)
+        with NetNSEnter(str(ns_h)):
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/48"],
+                     "PIO of a router that is not a SNAC router")
+
+            # An entry of the administrator keeps the prefixes it covers
+            # out, the same prefix or a broader one, until it is removed.
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fdaa::', 48, 5,
+                                      ifindex=veth0), 0)
+            ksft_eq(sorted(_kl_rows(veth0)), ["fdb0::/48", "fdbb::/48"])
+            ksft_eq(_addrlabel_dump(veth0)['fdaa::/48'].get('precedence'),
+                    None)
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00::', 8, 5, 3), 0)
+            ksft_eq(_kl_rows(veth0), {})
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fd00::', 8, 5), 0)
+            _kl_wait(veth0, ["fdb0::/48", "fdbb::/48"], "after admin delete")
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fdaa::', 48, 5,
+                                      ifindex=veth0), 0)
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/48"],
+                     "after admin delete")
+
+            # A removed entry stays away until the prefixes change.
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fdaa::', 48, 14,
+                                      ifindex=veth0), 0)
+            ksft_eq(sorted(_kl_rows(veth0)), ["fdb0::/48", "fdbb::/48"])
+            ip("-6 address add fdcc::1/64 dev veth0")
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/48",
+                             "fdcc::/48"], "after a new address")
+            ip("-6 address del fdcc::1/64 dev veth0")
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/48"],
+                     "after removing an address")
+
+        # A RIO for a shorter prefix replaces the ones it covers, whatever
+        # the order.
+        _send_ra(sock1, ifindex, 0, rio=('fdbb::', 40, 600))
+        with NetNSEnter(str(ns_h)):
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/40"],
+                     "covering RIO")
+
+            # The entries apply to all interfaces, like the policy table
+            # of the draft.
+            ip("link add name dummy1 type dummy")
+            ip("link set dev dummy1 up")
+            ip("-6 address add fdee::1/64 dev dummy1 nodad")
+            _kl_wait(socket.if_nametoindex("dummy1"), ["fdee::/48"],
+                     "address of another interface")
+            ip("-6 route add fdee:0:0:2::/64 dev veth0")
+            sel = _addr_selection("fdee:0:0:2::1")
+            ksft_eq((sel['dst_label'], sel['precedence']), (14, 45))
+            ip("link del dev dummy1")
+
+            _write_ipv6_sysctl("conf/veth0/known_local_ula", 0)
+            _kl_wait(veth0, [], "disabled on the interface")
+            _write_ipv6_sysctl("conf/veth0/known_local_ula", 1)
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/40"],
+                     "enabled again")
+            _write_ipv6_sysctl("conf/all/known_local_ula", 0)
+            _kl_wait(veth0, [], "disabled for all")
+            _write_ipv6_sysctl("conf/all/known_local_ula", 1)
+            _kl_wait(veth0, ["fdaa::/48", "fdb0::/48", "fdbb::/40"],
+                     "enabled for all")
+
+
+def ipv6_addrlabel_known_local_saddr() -> None:
+    """
+    Known-local entries change source address selection for ULA
+    destinations that are not known-local: with privacy addresses, a
+    temporary global address wins over a known-local ULA (rules 6 and 7).
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        try:
+            with NetNSEnter(str(ns_h)):
+                _write_ipv6_sysctl("conf/all/known_local_ula", 0)
+        except OSError as e:
+            raise KsftSkipEx("kernel does not support known_local_ula") from e
+
+        (sock,), ifindex, veth0 = _ra_host(
+            ns_h, ns_r, ["fe80::1"], **{"conf/veth0/use_tempaddr": 2})
+        with NetNSEnter(str(ns_h)):
+            ip("-6 address add fdaa:0:0:1::1/64 dev veth0")
+        # Default router, both prefixes advertised, so rule 5.5 ties.
+        _send_ra(sock, ifindex, 1800,
+                 pios=[('2001:db8:1::', 64, 600, 0xc0),
+                       ('fdaa:0:0:1::', 64, 600, 0x80)])
+        with NetNSEnter(str(ns_h)):
+            def temporary():
+                for entry in ip("-6 address show dev veth0 temporary",
+                                json=True):
+                    for addr in entry.get('addr_info', []):
+                        return addr['local']
+                return None
+            ksft_busy_wait(temporary, deadline=10,
+                           comment="no temporary address")
+            tmp = temporary()
+
+            ksft_eq(_saddr("fdcc::1"), "fdaa:0:0:1::1")
+            _write_ipv6_sysctl("conf/all/known_local_ula", 1)
+            _kl_wait(veth0, ["fdaa::/48"], "known-local address")
+            ksft_eq(_saddr("fdcc::1"), tmp)
+            ksft_eq(_saddr("fdaa:0:0:2::1"), "fdaa:0:0:1::1")
+
+
+def ipv6_addrlabel_known_local_netns() -> None:
+    """Removing a namespace while known-local entries are being computed."""
+
+    for _ in range(20):
+        with NetNS() as ns:
+            ip("link add name dummy1 type dummy", ns=str(ns))
+            with NetNSEnter(str(ns)):
+                try:
+                    _write_ipv6_sysctl("conf/all/known_local_ula", 1)
+                except OSError as e:
+                    raise KsftSkipEx("kernel does not support known_local_ula") from e
+                _write_ipv6_sysctl("conf/dummy1/known_local_ula", 1)
+                _write_ipv6_sysctl("conf/dummy1/accept_dad", 0)
+                ip("link set dev dummy1 up")
+                for i in range(4):
+                    ip(f"-6 address add fd00:{i}::1/64 dev dummy1")
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, ipv4_devconf_notify,
               ipv6_route_del_reason_expired,
@@ -1331,7 +1615,11 @@ def main() -> None:
               ipv6_ndisc_useropt_rio,
               ipv6_addrlabel_precedence,
               ipv6_addrlabel_notify,
-              ipv6_addr_selection])
+              ipv6_addr_selection,
+              ipv6_adv_prefix_rio,
+              ipv6_addrlabel_known_local,
+              ipv6_addrlabel_known_local_saddr,
+              ipv6_addrlabel_known_local_netns])
     ksft_exit()
 
 if __name__ == "__main__":
