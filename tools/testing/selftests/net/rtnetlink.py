@@ -201,7 +201,8 @@ def ipv6_route_del_reason_expired() -> None:
             ksft_eq(attrs.get('del-reason'), 'expired')
 
 
-def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80):
+def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80,
+             ra_flags=0):
     """
     The kernel fills in the ICMPv6 checksum on raw ICMPv6 sockets.
     The PIO is on-link only (L set, A clear) unless pio_flags says otherwise.
@@ -209,7 +210,7 @@ def _send_ra(sock, ifindex, lifetime, rio=None, pio=None, pio_flags=0x80):
 
     # type, code, cksum, hop limit, flags, router lifetime,
     # reachable time, retrans timer
-    ra = struct.pack('!BBHBBHII', 134, 0, 0, 64, 0, lifetime, 0, 0)
+    ra = struct.pack('!BBHBBHII', 134, 0, 0, 64, ra_flags, lifetime, 0, 0)
     if rio is not None:
         prefix, plen, rio_lifetime = rio
         # RFC 4191 route information option, /64 prefix (8 bytes)
@@ -456,6 +457,7 @@ PREFIX_CACHEINFO = 2
 PREFIX_ROUTER = 3
 PREFIX_PROTO = 4
 ND_OPT_PREFIX_INFO = 3
+ND_OPT_ROUTE_INFO = 24
 RTNLGRP_IPV6_ADV_PREFIX = 40
 RTPROT_STATIC = 4
 RTPROT_RA = 9
@@ -909,6 +911,107 @@ def ipv6_saddr_adv_prefix_rule() -> None:
                     ("fe80::2", "2001:db8:2::1"))
 
 
+RTM_NEWNDUSEROPT = 68
+RTNLGRP_ND_USEROPT = 20
+NDUSEROPT_SRCADDR = 1
+NDUSEROPT_RA_FLAGS = 2
+NDUSEROPTMSG_LEN = 16
+
+
+def _useropts(sock, count, deadline=5):
+    """
+    Return the next count RTM_NEWNDUSEROPT received on sock, as
+    (option type, {attr type: payload}), or fewer on timeout.
+    """
+
+    opts = []
+    end = time.time() + deadline
+    while len(opts) < count and time.time() < end:
+        sock.settimeout(max(end - time.time(), 0.01))
+        try:
+            data = sock.recv(65536)
+        except socket.timeout:
+            break
+        for nl_type, raw, hdr, _ in _nlmsgs(data, NDUSEROPTMSG_LEN):
+            if nl_type != RTM_NEWNDUSEROPT:
+                continue
+            _, _, opts_len = struct.unpack_from('=BBH', hdr)
+            # The attributes follow the option, a multiple of 8 bytes long.
+            _, _, _, attrs = next(_nlmsgs(raw, NDUSEROPTMSG_LEN + opts_len))
+            opts.append((raw[16 + NDUSEROPTMSG_LEN], attrs))
+    return opts
+
+
+def ipv6_ndisc_useropt_ra_flags() -> None:
+    """
+    The options of Router Advertisements forwarded to userspace come with
+    the flags of the RA, e.g. the SNAC Router flag (RFC 6724 rules 1 and 5
+    of draft-ietf-6man-rfc6724-update).
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        ip(f"link add veth0 netns {ns_h} type veth peer name veth1 netns {ns_r}")
+        with NetNSEnter(str(ns_h)):
+            _write_ipv6_sysctl("conf/veth0/accept_dad", 0)
+            _write_ipv6_sysctl("conf/veth0/accept_ra", 2)
+        ip("link set dev veth0 up", ns=str(ns_h))
+        ip("link set dev veth1 up", ns=str(ns_r))
+        ip("-6 address add fe80::1/64 dev veth1 nodad", ns=str(ns_r))
+        sock, ifindex = _ra_sock_from(ns_r, "veth1", "fe80::1")
+
+        with NetNSEnter(str(ns_h)):
+            listener = _rtnl_listen(RTNLGRP_ND_USEROPT)
+            defer(listener.close)
+
+        for ra_flags in (0x42, 0x00):
+            _send_ra(sock, ifindex, 0, pio=('fd00:1::', 64, 600),
+                     pio_flags=0x80, ra_flags=ra_flags)
+            opts = _useropts(listener, 1)
+            ksft_eq(len(opts), 1)
+            if not opts:
+                return
+            opt_type, attrs = opts[0]
+            ksft_eq(opt_type, ND_OPT_PREFIX_INFO)
+            ksft_eq(attrs.get(NDUSEROPT_SRCADDR), _in6("fe80::1"))
+            if NDUSEROPT_RA_FLAGS not in attrs:
+                raise KsftSkipEx("kernel does not report the RA flags")
+            ksft_eq(attrs[NDUSEROPT_RA_FLAGS], bytes([ra_flags]))
+
+
+def ipv6_ndisc_useropt_rio() -> None:
+    """
+    Route Information options are forwarded to userspace, like Prefix
+    Information options, for the known-local ULAs of
+    draft-ietf-6man-rfc6724-update, even when the kernel does not install
+    them as routes.
+    """
+
+    with NetNS() as ns_h, NetNS() as ns_r:
+        ip(f"link add veth0 netns {ns_h} type veth peer name veth1 netns {ns_r}")
+        with NetNSEnter(str(ns_h)):
+            _write_ipv6_sysctl("conf/veth0/accept_dad", 0)
+            _write_ipv6_sysctl("conf/veth0/accept_ra", 2)
+            _write_ipv6_sysctl("conf/veth0/accept_ra_rt_info_max_plen", 0)
+        ip("link set dev veth0 up", ns=str(ns_h))
+        ip("link set dev veth1 up", ns=str(ns_r))
+        ip("-6 address add fe80::1/64 dev veth1 nodad", ns=str(ns_r))
+        sock, ifindex = _ra_sock_from(ns_r, "veth1", "fe80::1")
+
+        with NetNSEnter(str(ns_h)):
+            listener = _rtnl_listen(RTNLGRP_ND_USEROPT)
+            defer(listener.close)
+
+        _send_ra(sock, ifindex, 0, rio=('fd00:2::', 48, 600),
+                 pio=('fd00:1::', 64, 600), pio_flags=0x80)
+        opts = _useropts(listener, 2)
+        ksft_ge(len(opts), 1)
+        if len(opts) == 1:
+            raise KsftSkipEx("kernel does not forward RIOs")
+        ksft_eq(sorted(t for t, _ in opts), [ND_OPT_PREFIX_INFO, ND_OPT_ROUTE_INFO])
+        for _, attrs in opts:
+            ksft_eq(attrs.get(NDUSEROPT_SRCADDR), _in6("fe80::1"))
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, ipv4_devconf_notify,
               ipv6_route_del_reason_expired,
@@ -919,7 +1022,9 @@ def main() -> None:
               ipv6_saddr_adv_prefix_subnet,
               ipv6_saddr_adv_prefix_ra,
               ipv6_saddr_adv_prefix_icmp,
-              ipv6_saddr_adv_prefix_rule])
+              ipv6_saddr_adv_prefix_rule,
+              ipv6_ndisc_useropt_ra_flags,
+              ipv6_ndisc_useropt_rio])
     ksft_exit()
 
 if __name__ == "__main__":
