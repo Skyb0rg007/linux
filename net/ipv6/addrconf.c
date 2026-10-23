@@ -176,7 +176,8 @@ static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
 static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifa);
 
 static void inet6_prefix_notify(int event, struct inet6_dev *idev,
-				struct prefix_info *pinfo);
+				struct prefix_info *pinfo,
+				const struct in6_addr *router);
 
 static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.forwarding		= 0,
@@ -1528,6 +1529,11 @@ out:
 /*
  *	Prefixes advertised by routers (RFC 8028)
  */
+static void inet6_adv_prefix_notify(struct inet6_dev *idev,
+				    const struct inet6_adv_prefix *p,
+				    int event, const struct nlmsghdr *nlh,
+				    u32 portid);
+
 static bool inet6_adv_prefix_expired(const struct inet6_adv_prefix *p)
 {
 	return !p->permanent && time_after_eq(jiffies, p->expires);
@@ -1552,13 +1558,16 @@ inet6_adv_prefix_find(struct inet6_dev *idev, const struct in6_addr *prefix,
 }
 
 static void inet6_adv_prefix_del(struct inet6_dev *idev,
-				 struct inet6_adv_prefix *p)
+				 struct inet6_adv_prefix *p,
+				 const struct nlmsghdr *nlh, u32 portid)
 {
 	lockdep_assert_held(&idev->lock);
 
 	hlist_del_rcu(&p->node);
 	idev->adv_prefixes_count--;
 	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
+	atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes_genid);
+	inet6_adv_prefix_notify(idev, p, RTM_DELPREFIX, nlh, portid);
 	kfree_rcu(p, rcu);
 }
 
@@ -1571,23 +1580,26 @@ static void inet6_adv_prefixes_flush(struct inet6_dev *idev, bool expired_only)
 
 	hlist_for_each_entry_safe(p, n, &idev->adv_prefixes, node) {
 		if (!expired_only || inet6_adv_prefix_expired(p))
-			inet6_adv_prefix_del(idev, p);
+			inet6_adv_prefix_del(idev, p, NULL, 0);
 	}
 }
 
 /* Add or update the entry for the prefix advertised by the router. Like other
  * rtnetlink objects, an existing entry is only updated with NLM_F_REPLACE,
- * and a missing entry is only created with NLM_F_CREATE.
+ * and a missing entry is only created with NLM_F_CREATE. Without @nlh, i.e.
+ * for a Router Advertisement, entries of another protocol are left alone, and
+ * a refreshed lifetime is not notified.
  */
 static int inet6_adv_prefix_set(struct inet6_dev *idev,
 				const struct in6_addr *prefix, u8 prefix_len,
 				const struct in6_addr *router, u8 flags,
-				u32 valid_lft, u16 nlflags, gfp_t gfp,
-				struct netlink_ext_ack *extack)
+				u8 protocol, u32 valid_lft, u16 nlflags,
+				gfp_t gfp, const struct nlmsghdr *nlh,
+				u32 portid, struct netlink_ext_ack *extack)
 {
 	struct inet6_adv_prefix *p, *new;
+	bool verify, notify = true;
 	unsigned long timeout;
-	bool verify = false;
 	int err = 0;
 
 	new = kzalloc_obj(*new, gfp);
@@ -1598,6 +1610,7 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 	new->prefix_len = prefix_len;
 	new->router = *router;
 	new->flags = flags;
+	new->protocol = protocol;
 	timeout = addrconf_timeout_fixup(valid_lft, HZ);
 	new->permanent = !addrconf_finite_timeout(timeout);
 	if (!new->permanent)
@@ -1614,6 +1627,8 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 	inet6_adv_prefixes_flush(idev, true);
 
 	p = inet6_adv_prefix_find(idev, &new->prefix, prefix_len, router);
+	if (p && !nlh && p->protocol != protocol)
+		goto unlock;
 
 	/* addrconf_verify_rtnl() expires the entry, unless it is already
 	 * scheduled to run before.
@@ -1627,6 +1642,9 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 			err = -EEXIST;
 			goto unlock;
 		}
+
+		notify = nlh || p->flags != new->flags ||
+			 p->permanent != new->permanent;
 
 		/* Readers may see the old or the new entry, never a mix. */
 		hlist_replace_rcu(&p->node, &new->node);
@@ -1647,20 +1665,28 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 		hlist_add_head_rcu(&new->node, &idev->adv_prefixes);
 		idev->adv_prefixes_count++;
 		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes);
+		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes_genid);
 	}
+	if (notify)
+		inet6_adv_prefix_notify(idev, new, RTM_NEWPREFIX, nlh, portid);
+	if (verify)
+		addrconf_verify(dev_net(idev->dev));
 	new = NULL;
 
 unlock:
 	write_unlock_bh(&idev->lock);
 	kfree(new);
-	if (!err && verify)
-		addrconf_verify(dev_net(idev->dev));
 	return err;
 }
 
+/* Only remove an entry of @protocol, if any. Router Advertisements, i.e.
+ * without @nlh, always pass theirs.
+ */
 static int inet6_adv_prefix_remove(struct inet6_dev *idev,
 				   const struct in6_addr *prefix,
-				   u8 prefix_len, const struct in6_addr *router)
+				   u8 prefix_len, const struct in6_addr *router,
+				   u8 protocol, const struct nlmsghdr *nlh,
+				   u32 portid)
 {
 	struct inet6_adv_prefix *p;
 	struct in6_addr pfx;
@@ -1670,8 +1696,8 @@ static int inet6_adv_prefix_remove(struct inet6_dev *idev,
 
 	write_lock_bh(&idev->lock);
 	p = inet6_adv_prefix_find(idev, &pfx, prefix_len, router);
-	if (p) {
-		inet6_adv_prefix_del(idev, p);
+	if (p && (!protocol || p->protocol == protocol)) {
+		inet6_adv_prefix_del(idev, p, nlh, portid);
 		err = 0;
 	}
 	write_unlock_bh(&idev->lock);
@@ -3199,7 +3225,7 @@ ok:
 					      prefered_lft,
 					      dev_addr_generated);
 	}
-	inet6_prefix_notify(RTM_NEWPREFIX, in6_dev, pinfo);
+	inet6_prefix_notify(RTM_NEWPREFIX, in6_dev, pinfo, router);
 adv_router:
 	/* RFC 8028 section 3.1: the router is a reasonable first hop for
 	 * source addresses in the prefix, whatever the flags of the option.
@@ -3208,12 +3234,13 @@ adv_router:
 		if (valid_lft)
 			inet6_adv_prefix_set(in6_dev, &pinfo->prefix,
 					     pinfo->prefix_len, router,
-					     pinfo->flags, valid_lft,
+					     pinfo->flags, RTPROT_RA, valid_lft,
 					     NLM_F_CREATE | NLM_F_REPLACE,
-					     GFP_ATOMIC, NULL);
+					     GFP_ATOMIC, NULL, 0, NULL);
 		else
 			inet6_adv_prefix_remove(in6_dev, &pinfo->prefix,
-						pinfo->prefix_len, router);
+						pinfo->prefix_len, router,
+						RTPROT_RA, NULL, 0);
 	}
 put:
 	in6_dev_put(in6_dev);
@@ -4932,7 +4959,7 @@ static void addrconf_verify_adv_prefixes(struct net *net, unsigned long *next)
 			if (p->permanent)
 				continue;
 			if (inet6_adv_prefix_expired(p))
-				inet6_adv_prefix_del(idev, p);
+				inet6_adv_prefix_del(idev, p, NULL, 0);
 			else if (time_before(p->expires, *next))
 				*next = p->expires;
 		}
@@ -6536,12 +6563,14 @@ errout:
 static inline size_t inet6_prefix_nlmsg_size(void)
 {
 	return NLMSG_ALIGN(sizeof(struct prefixmsg))
-	       + nla_total_size(sizeof(struct in6_addr))
-	       + nla_total_size(sizeof(struct prefix_cacheinfo));
+	       + nla_total_size(sizeof(struct in6_addr)) /* PREFIX_ADDRESS */
+	       + nla_total_size(sizeof(struct prefix_cacheinfo))
+	       + nla_total_size(sizeof(struct in6_addr)); /* PREFIX_ROUTER */
 }
 
 static int inet6_fill_prefix(struct sk_buff *skb, struct inet6_dev *idev,
-			     struct prefix_info *pinfo, u32 portid, u32 seq,
+			     struct prefix_info *pinfo,
+			     const struct in6_addr *router, u32 portid, u32 seq,
 			     int event, unsigned int flags)
 {
 	struct prefixmsg *pmsg;
@@ -6568,6 +6597,8 @@ static int inet6_fill_prefix(struct sk_buff *skb, struct inet6_dev *idev,
 	ci.valid_time = ntohl(pinfo->valid);
 	if (nla_put(skb, PREFIX_CACHEINFO, sizeof(ci), &ci))
 		goto nla_put_failure;
+	if (router && nla_put_in6_addr(skb, PREFIX_ROUTER, router))
+		goto nla_put_failure;
 	nlmsg_end(skb, nlh);
 	return 0;
 
@@ -6577,7 +6608,8 @@ nla_put_failure:
 }
 
 static void inet6_prefix_notify(int event, struct inet6_dev *idev,
-			 struct prefix_info *pinfo)
+			 struct prefix_info *pinfo,
+			 const struct in6_addr *router)
 {
 	struct sk_buff *skb;
 	struct net *net = dev_net(idev->dev);
@@ -6587,7 +6619,7 @@ static void inet6_prefix_notify(int event, struct inet6_dev *idev,
 	if (!skb)
 		goto errout;
 
-	err = inet6_fill_prefix(skb, idev, pinfo, 0, 0, event, 0);
+	err = inet6_fill_prefix(skb, idev, pinfo, router, 0, 0, event, 0);
 	if (err < 0) {
 		/* -EMSGSIZE implies BUG in inet6_prefix_nlmsg_size() */
 		WARN_ON(err == -EMSGSIZE);
@@ -6598,6 +6630,321 @@ static void inet6_prefix_notify(int event, struct inet6_dev *idev,
 	return;
 errout:
 	rtnl_set_sk_err(net, RTNLGRP_IPV6_PREFIX, err);
+}
+
+static const struct nla_policy prefix_policy[PREFIX_MAX + 1] = {
+	[PREFIX_ADDRESS]	= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+	[PREFIX_CACHEINFO]	=
+		NLA_POLICY_EXACT_LEN(sizeof(struct prefix_cacheinfo)),
+	[PREFIX_ROUTER]		= NLA_POLICY_EXACT_LEN(sizeof(struct in6_addr)),
+	[PREFIX_PROTO]		= { .type = NLA_U8 },
+};
+
+struct inet6_prefix_req {
+	struct inet6_dev	*idev;
+	struct in6_addr		prefix;
+	struct in6_addr		router;
+	u32			valid_lft;
+	u8			prefix_len;
+	u8			flags;
+	u8			protocol;
+};
+
+static int inet6_rtm_prefix_parse(struct sk_buff *skb, struct nlmsghdr *nlh,
+				  struct inet6_prefix_req *req, bool del,
+				  struct netlink_ext_ack *extack)
+{
+	struct net *net = sock_net(skb->sk);
+	struct nlattr *tb[PREFIX_MAX + 1];
+	struct prefixmsg *pmsg;
+	struct net_device *dev;
+	int err;
+
+	ASSERT_RTNL_NET(net);
+
+	err = nlmsg_parse(nlh, sizeof(*pmsg), tb, PREFIX_MAX, prefix_policy,
+			  extack);
+	if (err < 0)
+		return err;
+
+	pmsg = nlmsg_data(nlh);
+	if (pmsg->prefix_family != AF_INET6) {
+		NL_SET_ERR_MSG(extack, "Invalid address family");
+		return -EAFNOSUPPORT;
+	}
+
+	if (pmsg->prefix_pad1 || pmsg->prefix_pad2 || pmsg->prefix_pad3) {
+		NL_SET_ERR_MSG(extack, "Invalid values in header");
+		return -EINVAL;
+	}
+
+	if (pmsg->prefix_type != ND_OPT_PREFIX_INFO) {
+		NL_SET_ERR_MSG(extack, "Invalid prefix type");
+		return -EINVAL;
+	}
+
+	if (!pmsg->prefix_len || pmsg->prefix_len > 128) {
+		NL_SET_ERR_MSG(extack, "Invalid prefix length");
+		return -EINVAL;
+	}
+
+	if (NL_REQ_ATTR_CHECK(extack, NULL, tb, PREFIX_ADDRESS) ||
+	    NL_REQ_ATTR_CHECK(extack, NULL, tb, PREFIX_ROUTER))
+		return -EINVAL;
+
+	req->prefix = nla_get_in6_addr(tb[PREFIX_ADDRESS]);
+	req->router = nla_get_in6_addr(tb[PREFIX_ROUTER]);
+	req->prefix_len = pmsg->prefix_len;
+	req->flags = pmsg->prefix_flags;
+	req->protocol = nla_get_u8_default(tb[PREFIX_PROTO], RTPROT_UNSPEC);
+	if (!del && (req->protocol == RTPROT_KERNEL ||
+		     req->protocol == RTPROT_RA)) {
+		NL_SET_ERR_MSG_ATTR(extack, tb[PREFIX_PROTO],
+				    "Protocol reserved for the kernel");
+		return -EINVAL;
+	}
+
+	/* Like addrconf_prefix_rcv() */
+	if (ipv6_addr_type(&req->prefix) &
+	    (IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL)) {
+		NL_SET_ERR_MSG_ATTR(extack, tb[PREFIX_ADDRESS],
+				    "Prefix must not be multicast or link-local");
+		return -EINVAL;
+	}
+
+	/* Router Advertisements are sent from link-local addresses. */
+	if (!(ipv6_addr_type(&req->router) & IPV6_ADDR_LINKLOCAL) ||
+	    ipv6_addr_is_multicast(&req->router)) {
+		NL_SET_ERR_MSG_ATTR(extack, tb[PREFIX_ROUTER],
+				    "Router address must be link-local unicast");
+		return -EINVAL;
+	}
+
+	req->valid_lft = INFINITY_LIFE_TIME;
+	if (tb[PREFIX_CACHEINFO] && !del) {
+		struct prefix_cacheinfo *ci = nla_data(tb[PREFIX_CACHEINFO]);
+
+		req->valid_lft = ci->valid_time;
+		if (!req->valid_lft) {
+			NL_SET_ERR_MSG_ATTR(extack, tb[PREFIX_CACHEINFO],
+					    "Invalid valid lifetime");
+			return -EINVAL;
+		}
+	}
+
+	dev = __dev_get_by_index(net, pmsg->prefix_ifindex);
+	if (!dev) {
+		NL_SET_ERR_MSG(extack, "Unable to find the interface");
+		return -ENODEV;
+	}
+
+	req->idev = __in6_dev_get(dev);
+	if (!req->idev) {
+		NL_SET_ERR_MSG(extack, "IPv6 is disabled on this device");
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static int inet6_rtm_newprefix(struct sk_buff *skb, struct nlmsghdr *nlh,
+			       struct netlink_ext_ack *extack)
+{
+	struct net *net = sock_net(skb->sk);
+	struct inet6_prefix_req req;
+	int err;
+
+	rtnl_net_lock(net);
+	err = inet6_rtm_prefix_parse(skb, nlh, &req, false, extack);
+	if (err)
+		goto unlock;
+
+	err = inet6_adv_prefix_set(req.idev, &req.prefix, req.prefix_len,
+				   &req.router, req.flags, req.protocol,
+				   req.valid_lft, nlh->nlmsg_flags,
+				   GFP_KERNEL_ACCOUNT, nlh,
+				   NETLINK_CB(skb).portid, extack);
+unlock:
+	rtnl_net_unlock(net);
+	return err;
+}
+
+static int inet6_rtm_delprefix(struct sk_buff *skb, struct nlmsghdr *nlh,
+			       struct netlink_ext_ack *extack)
+{
+	struct net *net = sock_net(skb->sk);
+	struct inet6_prefix_req req;
+	int err;
+
+	rtnl_net_lock(net);
+	err = inet6_rtm_prefix_parse(skb, nlh, &req, true, extack);
+	if (err)
+		goto unlock;
+
+	err = inet6_adv_prefix_remove(req.idev, &req.prefix, req.prefix_len,
+				      &req.router, req.protocol, nlh,
+				      NETLINK_CB(skb).portid);
+	if (err)
+		NL_SET_ERR_MSG(extack, "Prefix not found");
+unlock:
+	rtnl_net_unlock(net);
+	return err;
+}
+
+static int inet6_fill_adv_prefix(struct sk_buff *skb,
+				 const struct inet6_dev *idev,
+				 const struct inet6_adv_prefix *p,
+				 u32 portid, u32 seq, int event,
+				 unsigned int flags)
+{
+	struct prefix_cacheinfo ci = {};
+	unsigned long now = jiffies;
+	struct prefixmsg *pmsg;
+	struct nlmsghdr *nlh;
+
+	nlh = nlmsg_put(skb, portid, seq, event, sizeof(*pmsg), flags);
+	if (!nlh)
+		return -EMSGSIZE;
+
+	pmsg = nlmsg_data(nlh);
+	memset(pmsg, 0, sizeof(*pmsg));
+	pmsg->prefix_family = AF_INET6;
+	pmsg->prefix_ifindex = idev->dev->ifindex;
+	pmsg->prefix_type = ND_OPT_PREFIX_INFO;
+	pmsg->prefix_len = p->prefix_len;
+	pmsg->prefix_flags = p->flags;
+
+	/* The preferred lifetime is not tracked. The valid lifetime is
+	 * rounded up, so that it can be passed back.
+	 */
+	if (p->permanent)
+		ci.valid_time = INFINITY_LIFE_TIME;
+	else if (time_before(now, p->expires))
+		ci.valid_time = DIV_ROUND_UP(p->expires - now, HZ);
+
+	if (nla_put_in6_addr(skb, PREFIX_ADDRESS, &p->prefix) ||
+	    nla_put(skb, PREFIX_CACHEINFO, sizeof(ci), &ci) ||
+	    nla_put_in6_addr(skb, PREFIX_ROUTER, &p->router) ||
+	    (p->protocol && nla_put_u8(skb, PREFIX_PROTO, p->protocol))) {
+		nlmsg_cancel(skb, nlh);
+		return -EMSGSIZE;
+	}
+
+	nlmsg_end(skb, nlh);
+	return 0;
+}
+
+static void inet6_adv_prefix_notify(struct inet6_dev *idev,
+				    const struct inet6_adv_prefix *p,
+				    int event, const struct nlmsghdr *nlh,
+				    u32 portid)
+{
+	struct net *net = dev_net(idev->dev);
+	struct sk_buff *skb;
+	int err = -ENOBUFS;
+
+	if (!rtnl_notify_needed(net, nlh ? nlh->nlmsg_flags : 0,
+				RTNLGRP_IPV6_ADV_PREFIX))
+		return;
+
+	skb = nlmsg_new(inet6_prefix_nlmsg_size() + nla_total_size(1),
+			GFP_ATOMIC);
+	if (!skb)
+		goto errout;
+
+	err = inet6_fill_adv_prefix(skb, idev, p, portid,
+				    nlh ? nlh->nlmsg_seq : 0, event, 0);
+	if (err < 0) {
+		/* -EMSGSIZE implies BUG in the size above */
+		WARN_ON(err == -EMSGSIZE);
+		kfree_skb(skb);
+		goto errout;
+	}
+	rtnl_notify(skb, net, portid, RTNLGRP_IPV6_ADV_PREFIX, nlh, GFP_ATOMIC);
+	return;
+errout:
+	rtnl_set_sk_err(net, RTNLGRP_IPV6_ADV_PREFIX, err);
+}
+
+static int inet6_dump_prefix_filter(const struct nlmsghdr *nlh,
+				    int *ifindex,
+				    struct netlink_ext_ack *extack)
+{
+	struct prefixmsg *pmsg;
+
+	pmsg = nlmsg_payload(nlh, sizeof(*pmsg));
+	if (!pmsg) {
+		NL_SET_ERR_MSG(extack, "Invalid header for prefix dump request");
+		return -EINVAL;
+	}
+
+	/* The entries are all of Prefix Information options */
+	if (pmsg->prefix_pad1 || pmsg->prefix_pad2 || pmsg->prefix_pad3 ||
+	    (pmsg->prefix_type && pmsg->prefix_type != ND_OPT_PREFIX_INFO) ||
+	    pmsg->prefix_len || pmsg->prefix_flags) {
+		NL_SET_ERR_MSG(extack, "Invalid values in header for prefix dump request");
+		return -EINVAL;
+	}
+
+	if (nlmsg_attrlen(nlh, sizeof(*pmsg))) {
+		NL_SET_ERR_MSG(extack, "Invalid data after header for prefix dump request");
+		return -EINVAL;
+	}
+
+	*ifindex = pmsg->prefix_ifindex;
+	return 0;
+}
+
+static int inet6_dump_prefix(struct sk_buff *skb, struct netlink_callback *cb)
+{
+	struct net *net = sock_net(skb->sk);
+	struct {
+		unsigned long ifindex;
+		unsigned int idx;
+	} *ctx = (void *)cb->ctx;
+	const struct inet6_adv_prefix *p;
+	struct net_device *dev;
+	struct inet6_dev *idev;
+	int ifindex = 0;
+	int err = 0;
+
+	/* A new request, hence always checked strictly */
+	err = inet6_dump_prefix_filter(cb->nlh, &ifindex, cb->extack);
+	if (err < 0)
+		return err;
+
+	rcu_read_lock();
+	cb->seq = (atomic_read(&net->ipv6.adv_prefixes_genid) +
+		   READ_ONCE(net->dev_base_seq)) ?: 1;
+	for_each_netdev_dump(net, dev, ctx->ifindex) {
+		unsigned int idx = 0;
+
+		if (ifindex && dev->ifindex != ifindex)
+			continue;
+
+		idev = __in6_dev_get(dev);
+		if (!idev)
+			continue;
+
+		hlist_for_each_entry_rcu(p, &idev->adv_prefixes, node) {
+			if (idx++ < ctx->idx || inet6_adv_prefix_expired(p))
+				continue;
+
+			err = inet6_fill_adv_prefix(skb, idev, p,
+						    NETLINK_CB(cb->skb).portid,
+						    cb->nlh->nlmsg_seq,
+						    RTM_NEWPREFIX, NLM_F_MULTI);
+			if (err < 0) {
+				ctx->idx = idx - 1;
+				goto out;
+			}
+			nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+		}
+		ctx->idx = 0;
+	}
+out:
+	rcu_read_unlock();
+	return err;
 }
 
 static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
@@ -7864,6 +8211,12 @@ static const struct rtnl_msg_handler addrconf_rtnl_msg_handlers[] __initconst_or
 	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_GETNETCONF,
 	 .doit = inet6_netconf_get_devconf, .dumpit = inet6_netconf_dump_devconf,
 	 .flags = RTNL_FLAG_DOIT_UNLOCKED | RTNL_FLAG_DUMP_UNLOCKED},
+	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_NEWPREFIX,
+	 .doit = inet6_rtm_newprefix, .flags = RTNL_FLAG_DOIT_PERNET},
+	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_DELPREFIX,
+	 .doit = inet6_rtm_delprefix, .flags = RTNL_FLAG_DOIT_PERNET},
+	{.owner = THIS_MODULE, .protocol = PF_INET6, .msgtype = RTM_GETPREFIX,
+	 .dumpit = inet6_dump_prefix, .flags = RTNL_FLAG_DUMP_UNLOCKED},
 };
 
 /*
