@@ -1526,16 +1526,23 @@ static bool inet6_adv_prefix_expired(const struct inet6_adv_prefix *p)
 	return !p->permanent && time_after_eq(jiffies, p->expires);
 }
 
+static unsigned int *inet6_adv_prefix_count(struct inet6_dev *idev, u8 type)
+{
+	return type == ND_OPT_ROUTE_INFO ? &idev->adv_rios_count :
+					   &idev->adv_prefixes_count;
+}
+
 static struct inet6_adv_prefix *
-inet6_adv_prefix_find(struct inet6_dev *idev, const struct in6_addr *prefix,
-		      u8 prefix_len, const struct in6_addr *router)
+inet6_adv_prefix_find(struct inet6_dev *idev, u8 type,
+		      const struct in6_addr *prefix, u8 prefix_len,
+		      const struct in6_addr *router)
 {
 	struct inet6_adv_prefix *p;
 
 	lockdep_assert_held(&idev->lock);
 
 	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
-		if (p->prefix_len == prefix_len &&
+		if (p->type == type && p->prefix_len == prefix_len &&
 		    ipv6_addr_equal(&p->prefix, prefix) &&
 		    ipv6_addr_equal(&p->router, router))
 			return p;
@@ -1551,7 +1558,7 @@ static void inet6_adv_prefix_del(struct inet6_dev *idev,
 	lockdep_assert_held(&idev->lock);
 
 	hlist_del_rcu(&p->node);
-	idev->adv_prefixes_count--;
+	(*inet6_adv_prefix_count(idev, p->type))--;
 	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
 	atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes_genid);
 	inet6_adv_prefix_notify(idev, p, RTM_DELPREFIX, nlh, portid);
@@ -1595,6 +1602,7 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 	ipv6_addr_prefix(&new->prefix, &tmpl->prefix, tmpl->prefix_len);
 	new->prefix_len = tmpl->prefix_len;
 	new->router = tmpl->router;
+	new->type = tmpl->type;
 	new->flags = tmpl->flags;
 	new->ra_flags = tmpl->ra_flags;
 	new->protocol = tmpl->protocol;
@@ -1613,8 +1621,8 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 
 	inet6_adv_prefixes_flush(idev, true);
 
-	p = inet6_adv_prefix_find(idev, &new->prefix, new->prefix_len,
-				  &new->router);
+	p = inet6_adv_prefix_find(idev, new->type, &new->prefix,
+				  new->prefix_len, &new->router);
 	if (p && !nlh && p->protocol != new->protocol)
 		goto unlock;
 
@@ -1645,14 +1653,16 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 			goto unlock;
 		}
 
-		if (idev->adv_prefixes_count >= INET6_ADV_PREFIXES_MAX) {
+		if (*inet6_adv_prefix_count(idev, new->type) >=
+		    (new->type == ND_OPT_ROUTE_INFO ? INET6_ADV_RIOS_MAX :
+						      INET6_ADV_PREFIXES_MAX)) {
 			NL_SET_ERR_MSG(extack, "Too many advertised prefixes");
 			err = -ENOSPC;
 			goto unlock;
 		}
 
 		hlist_add_head_rcu(&new->node, &idev->adv_prefixes);
-		idev->adv_prefixes_count++;
+		(*inet6_adv_prefix_count(idev, new->type))++;
 		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes);
 		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes_genid);
 	}
@@ -1671,7 +1681,7 @@ unlock:
 /* Only remove an entry of @protocol, if any. Router Advertisements, i.e.
  * without @nlh, always pass theirs.
  */
-static int inet6_adv_prefix_remove(struct inet6_dev *idev,
+static int inet6_adv_prefix_remove(struct inet6_dev *idev, u8 type,
 				   const struct in6_addr *prefix,
 				   u8 prefix_len, const struct in6_addr *router,
 				   u8 protocol, const struct nlmsghdr *nlh,
@@ -1684,7 +1694,7 @@ static int inet6_adv_prefix_remove(struct inet6_dev *idev,
 	ipv6_addr_prefix(&pfx, prefix, prefix_len);
 
 	write_lock_bh(&idev->lock);
-	p = inet6_adv_prefix_find(idev, &pfx, prefix_len, router);
+	p = inet6_adv_prefix_find(idev, type, &pfx, prefix_len, router);
 	if (p && (!protocol || p->protocol == protocol)) {
 		inet6_adv_prefix_del(idev, p, nlh, portid);
 		err = 0;
@@ -1715,7 +1725,7 @@ static bool ipv6_ifa_advertised_by_others(const struct inet6_ifaddr *ifp,
 	bool others = false;
 
 	hlist_for_each_entry_rcu(p, &ifp->idev->adv_prefixes, node) {
-		if (p->prefix_len > max_len ||
+		if (p->type != ND_OPT_PREFIX_INFO || p->prefix_len > max_len ||
 		    !ipv6_prefix_equal(&ifp->addr, &p->prefix, p->prefix_len) ||
 		    inet6_adv_prefix_expired(p))
 			continue;
@@ -1725,6 +1735,40 @@ static bool ipv6_ifa_advertised_by_others(const struct inet6_ifaddr *ifp,
 	}
 
 	return others;
+}
+
+/* Remember the routers that advertise a prefix in a Route Information
+ * option (RFC 4191) that the interface accepted, like in Prefix Information
+ * options, e.g. for draft-ietf-6man-rfc6724-update.
+ */
+void addrconf_rio_rcv(struct inet6_dev *idev, const struct route_info *ri,
+		      const struct in6_addr *router, u8 ra_flags)
+{
+	struct inet6_adv_prefix tmpl = {
+		.router = *router,
+		.prefix_len = ri->prefix_len,
+		.type = ND_OPT_ROUTE_INFO,
+		.flags = ((const u8 *)ri)[3],
+		.ra_flags = ra_flags,
+		.protocol = RTPROT_RA,
+	};
+	u32 lifetime = ntohl(ri->lifetime);
+
+	/* A default route is not a prefix. rt6_route_rcv() checked that the
+	 * length of the option holds the prefix.
+	 */
+	if (!ri->prefix_len)
+		return;
+	memcpy(&tmpl.prefix, ri->prefix, (ri->length - 1) * 8);
+
+	if (lifetime)
+		inet6_adv_prefix_set(idev, &tmpl, lifetime,
+				     NLM_F_CREATE | NLM_F_REPLACE, GFP_ATOMIC,
+				     NULL, 0, NULL);
+	else
+		inet6_adv_prefix_remove(idev, ND_OPT_ROUTE_INFO, &tmpl.prefix,
+					tmpl.prefix_len, router, RTPROT_RA,
+					NULL, 0);
 }
 
 /*
@@ -3319,6 +3363,7 @@ adv_router:
 			.prefix = pinfo->prefix,
 			.router = *router,
 			.prefix_len = pinfo->prefix_len,
+			.type = ND_OPT_PREFIX_INFO,
 			.flags = pinfo->flags,
 			.ra_flags = ra_flags,
 			.protocol = RTPROT_RA,
@@ -3329,7 +3374,8 @@ adv_router:
 					     NLM_F_CREATE | NLM_F_REPLACE,
 					     GFP_ATOMIC, NULL, 0, NULL);
 		else
-			inet6_adv_prefix_remove(in6_dev, &pinfo->prefix,
+			inet6_adv_prefix_remove(in6_dev, ND_OPT_PREFIX_INFO,
+						&pinfo->prefix,
 						pinfo->prefix_len, router,
 						RTPROT_RA, NULL, 0);
 	}
@@ -6730,6 +6776,7 @@ struct inet6_prefix_req {
 	struct in6_addr		router;
 	u32			valid_lft;
 	u8			prefix_len;
+	u8			type;
 	u8			flags;
 	u8			ra_flags;
 	u8			protocol;
@@ -6763,7 +6810,8 @@ static int inet6_rtm_prefix_parse(struct sk_buff *skb, struct nlmsghdr *nlh,
 		return -EINVAL;
 	}
 
-	if (pmsg->prefix_type != ND_OPT_PREFIX_INFO) {
+	if (pmsg->prefix_type != ND_OPT_PREFIX_INFO &&
+	    pmsg->prefix_type != ND_OPT_ROUTE_INFO) {
 		NL_SET_ERR_MSG(extack, "Invalid prefix type");
 		return -EINVAL;
 	}
@@ -6780,6 +6828,7 @@ static int inet6_rtm_prefix_parse(struct sk_buff *skb, struct nlmsghdr *nlh,
 	req->prefix = nla_get_in6_addr(tb[PREFIX_ADDRESS]);
 	req->router = nla_get_in6_addr(tb[PREFIX_ROUTER]);
 	req->prefix_len = pmsg->prefix_len;
+	req->type = pmsg->prefix_type;
 	req->flags = pmsg->prefix_flags;
 	req->protocol = nla_get_u8_default(tb[PREFIX_PROTO], RTPROT_UNSPEC);
 	if (!del && (req->protocol == RTPROT_KERNEL ||
@@ -6849,6 +6898,7 @@ static int inet6_rtm_newprefix(struct sk_buff *skb, struct nlmsghdr *nlh,
 	tmpl.prefix = req.prefix;
 	tmpl.router = req.router;
 	tmpl.prefix_len = req.prefix_len;
+	tmpl.type = req.type;
 	tmpl.flags = req.flags;
 	tmpl.ra_flags = req.ra_flags;
 	tmpl.protocol = req.protocol;
@@ -6872,7 +6922,8 @@ static int inet6_rtm_delprefix(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (err)
 		goto unlock;
 
-	err = inet6_adv_prefix_remove(req.idev, &req.prefix, req.prefix_len,
+	err = inet6_adv_prefix_remove(req.idev, req.type, &req.prefix,
+				      req.prefix_len,
 				      &req.router, req.protocol, nlh,
 				      NETLINK_CB(skb).portid);
 	if (err)
@@ -6908,7 +6959,7 @@ static int inet6_fill_adv_prefix(struct sk_buff *skb,
 	memset(pmsg, 0, sizeof(*pmsg));
 	pmsg->prefix_family = AF_INET6;
 	pmsg->prefix_ifindex = idev->dev->ifindex;
-	pmsg->prefix_type = ND_OPT_PREFIX_INFO;
+	pmsg->prefix_type = p->type;
 	pmsg->prefix_len = p->prefix_len;
 	pmsg->prefix_flags = p->flags;
 
@@ -6965,7 +7016,7 @@ errout:
 }
 
 static int inet6_dump_prefix_filter(const struct nlmsghdr *nlh,
-				    int *ifindex,
+				    int *ifindex, u8 *type,
 				    struct netlink_ext_ack *extack)
 {
 	struct prefixmsg *pmsg;
@@ -6976,9 +7027,9 @@ static int inet6_dump_prefix_filter(const struct nlmsghdr *nlh,
 		return -EINVAL;
 	}
 
-	/* The entries are all of Prefix Information options */
 	if (pmsg->prefix_pad1 || pmsg->prefix_pad2 || pmsg->prefix_pad3 ||
-	    (pmsg->prefix_type && pmsg->prefix_type != ND_OPT_PREFIX_INFO) ||
+	    (pmsg->prefix_type && pmsg->prefix_type != ND_OPT_PREFIX_INFO &&
+	     pmsg->prefix_type != ND_OPT_ROUTE_INFO) ||
 	    pmsg->prefix_len || pmsg->prefix_flags) {
 		NL_SET_ERR_MSG(extack, "Invalid values in header for prefix dump request");
 		return -EINVAL;
@@ -6990,6 +7041,7 @@ static int inet6_dump_prefix_filter(const struct nlmsghdr *nlh,
 	}
 
 	*ifindex = pmsg->prefix_ifindex;
+	*type = pmsg->prefix_type;
 	return 0;
 }
 
@@ -7004,10 +7056,11 @@ static int inet6_dump_prefix(struct sk_buff *skb, struct netlink_callback *cb)
 	struct net_device *dev;
 	struct inet6_dev *idev;
 	int ifindex = 0;
+	u8 type = 0;
 	int err = 0;
 
 	/* A new request, hence always checked strictly */
-	err = inet6_dump_prefix_filter(cb->nlh, &ifindex, cb->extack);
+	err = inet6_dump_prefix_filter(cb->nlh, &ifindex, &type, cb->extack);
 	if (err < 0)
 		return err;
 
@@ -7025,7 +7078,8 @@ static int inet6_dump_prefix(struct sk_buff *skb, struct netlink_callback *cb)
 			continue;
 
 		hlist_for_each_entry_rcu(p, &idev->adv_prefixes, node) {
-			if (idx++ < ctx->idx || inet6_adv_prefix_expired(p))
+			if (idx++ < ctx->idx || inet6_adv_prefix_expired(p) ||
+			    (type && p->type != type))
 				continue;
 
 			err = inet6_fill_adv_prefix(skb, idev, p,
