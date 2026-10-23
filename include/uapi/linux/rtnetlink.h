@@ -629,8 +629,11 @@ struct prefixmsg {
  * in a prefix advertised by the next-hop (RFC 6724, rule 5.5). Entries are
  * keyed by interface, prefix, prefix length and router, and expire after
  * PREFIX_CACHEINFO's valid_time, infinite if absent. The preferred_time is
- * ignored, and reported as 0. prefix_type is ND_OPT_PREFIX_INFO, and
- * prefix_flags the flags of the option, which are only reported.
+ * ignored, and reported as 0. prefix_flags is the flags byte of the option,
+ * which is only reported. prefix_type is ND_OPT_PREFIX_INFO, or
+ * ND_OPT_ROUTE_INFO for the Route Information options (RFC 4191) that the
+ * interface accepted (accept_ra_rt_info_min_plen and max_plen), but rule 5.5
+ * only uses the former. Dumps can be filtered by prefix_type.
  *
  * Userspace that processes Router Advertisements itself manages these
  * entries with RTM_NEWPREFIX and RTM_DELPREFIX, and they are dumped with
