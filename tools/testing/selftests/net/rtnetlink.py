@@ -1170,6 +1170,126 @@ def ipv6_addrlabel_notify() -> None:
             ksft_eq(len(seqs), 2)
 
 
+IPV6_ADDR_SELECTION = 79
+IPV6_ADDR_SEL_SRC_DEPRECATED = 0x0001
+IPV6_ADDR_SEL_SRC_HOME = 0x0002
+IPV6_ADDR_SEL_DST_NO_PRECEDENCE = 0x0004
+IPV6_ADDR_SELECTION_LEN = 24
+ARPHRD_ETHER = 1
+
+
+def _sock_addr_selection(sock):
+    data = sock.getsockopt(socket.IPPROTO_IPV6, IPV6_ADDR_SELECTION,
+                           IPV6_ADDR_SELECTION_LEN)
+    flags, src_label, dst_label, precedence, plen, oif_type, oif = \
+        struct.unpack('=IIIIBxHI', data)
+    return {'flags': flags, 'src_label': src_label, 'dst_label': dst_label,
+            'precedence': precedence, 'src_prefixlen': plen,
+            'oif': oif, 'oif_type': oif_type}
+
+
+def _addr_selection(daddr):
+    """IPV6_ADDR_SELECTION of a UDP socket connected to daddr."""
+
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+        sock.connect((daddr, 9))
+        return _sock_addr_selection(sock)
+
+
+def ipv6_addr_selection() -> None:
+    """
+    IPV6_ADDR_SELECTION gives a connected socket what RFC 6724 destination
+    address selection needs to know about its addresses, without rtnetlink.
+    """
+
+    with NetNS() as ns:
+        ip("link add name dummy1 type dummy", ns=str(ns))
+        with NetNSEnter(str(ns)):
+            _write_ipv6_sysctl("conf/dummy1/accept_dad", 0)
+            ip("link set dev dummy1 up")
+            ip("-6 address add 2001:db8:1::1/64 dev dummy1")
+            ip("-6 address add fd00:1::1/64 dev dummy1")
+            ip("-4 address add 192.0.2.1/24 dev dummy1")
+            ip("-6 route add 2001:10::/28 dev dummy1")
+            ip("-6 route add fd00:2::/48 dev dummy1")
+            dummy1 = socket.if_nametoindex("dummy1")
+
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                try:
+                    sock.getsockopt(socket.IPPROTO_IPV6, IPV6_ADDR_SELECTION, 20)
+                    err = 0
+                except OSError as e:
+                    err = e.errno
+            if err == errno.ENOPROTOOPT:
+                raise KsftSkipEx("kernel does not support IPV6_ADDR_SELECTION")
+            ksft_eq(err, errno.ENOTCONN)
+
+            oif = {'oif': dummy1, 'oif_type': ARPHRD_ETHER}
+            ksft_eq(_addr_selection("2001:db8:1::2"),
+                    {'flags': 0, 'src_label': 1, 'dst_label': 1,
+                     'precedence': 40, 'src_prefixlen': 64, **oif})
+            ksft_eq(_addr_selection("fd00:1::2"),
+                    {'flags': 0, 'src_label': 5, 'dst_label': 5,
+                     'precedence': 30, 'src_prefixlen': 64, **oif})
+            ksft_eq(_addr_selection("::ffff:192.0.2.2"),
+                    {'flags': 0, 'src_label': 4, 'dst_label': 4,
+                     'precedence': 20, 'src_prefixlen': 96 + 24, **oif})
+
+            # The labels of the source and destination are looked up with
+            # their own interfaces, like in source address selection.
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 14, 45), 0)
+            ip("addrlabel add prefix 2001:db8:1::/64 dev dummy1 label 20")
+            sel = _addr_selection("fd00:1::2")
+            ksft_eq((sel['src_label'], sel['dst_label'], sel['precedence']),
+                    (14, 14, 45))
+            sel = _addr_selection("2001:db8:1::2")
+            ksft_eq((sel['src_label'], sel['dst_label'], sel['precedence']),
+                    (20, 20, 40))
+
+            # Entries without a precedence take the one of a shorter prefix.
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:2::', 48, 15), 0)
+            sel = _addr_selection("fd00:2::2")
+            ksft_eq((sel['dst_label'], sel['precedence']), (15, 30))
+            ksft_eq(_addr_selection("2001:10::1")['precedence'], 40)
+
+            # Unprivileged users get the same.
+            ksft_eq(_as_nobody(lambda: _addr_selection("fd00:1::2")),
+                    _addr_selection("fd00:1::2"))
+
+            # Shorter buffers are filled up to their length.
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                sock.connect(("2001:db8:1::2", 9))
+                ksft_eq(sock.getsockopt(socket.IPPROTO_IPV6,
+                                        IPV6_ADDR_SELECTION, 4),
+                        struct.pack('=I', 0))
+                ksft_eq(len(sock.getsockopt(socket.IPPROTO_IPV6,
+                                            IPV6_ADDR_SELECTION, 64)),
+                        IPV6_ADDR_SELECTION_LEN)
+
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, '::', 0, 1), 0)
+            sel = _addr_selection("2001:db8:1::2")
+            ksft_eq((sel['flags'], sel['precedence']),
+                    (IPV6_ADDR_SEL_DST_NO_PRECEDENCE, 0))
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, '::', 0, 1), 0)
+            ksft_eq(_addr_selection("2001:db8:1::2")['precedence'], 40)
+
+            # The outgoing interface follows the routes, not the one that
+            # the socket last used.
+            ip("link add name dummy2 type dummy")
+            ip("link set dev dummy2 up")
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                sock.connect(("fd00:2::2", 9))
+                ip("-6 route replace fd00:2::/48 dev dummy2")
+                ksft_eq(_sock_addr_selection(sock)['oif'],
+                        socket.if_nametoindex("dummy2"))
+
+            # Rule 3 would pick fd00:1::1 over a deprecated address.
+            ip("-6 address del fd00:1::1/64 dev dummy1")
+            ip("-6 address change 2001:db8:1::1/64 dev dummy1 home "
+               "preferred_lft 0")
+            ksft_eq(_addr_selection("2001:db8:1::2")['flags'],
+                    IPV6_ADDR_SEL_SRC_DEPRECATED | IPV6_ADDR_SEL_SRC_HOME)
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, ipv4_devconf_notify,
               ipv6_route_del_reason_expired,
@@ -1184,7 +1304,8 @@ def main() -> None:
               ipv6_ndisc_useropt_ra_flags,
               ipv6_ndisc_useropt_rio,
               ipv6_addrlabel_precedence,
-              ipv6_addrlabel_notify])
+              ipv6_addrlabel_notify,
+              ipv6_addr_selection])
     ksft_exit()
 
 if __name__ == "__main__":
