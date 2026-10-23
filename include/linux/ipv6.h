@@ -1,389 +1,140 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _IPV6_H
-#define _IPV6_H
-
-#include <uapi/linux/ipv6.h>
-#include <linux/cache.h>
-
-#define ipv6_optlen(p)  (((p)->hdrlen+1) << 3)
-#define ipv6_authlen(p) (((p)->hdrlen+2) << 2)
 /*
- * This structure contains configuration options per IPv6 link.
- */
-struct ipv6_devconf {
-	/* RX & TX fastpath fields. */
-	__cacheline_group_begin(ipv6_devconf_read_txrx);
-	__s32		disable_ipv6;
-	__s32		hop_limit;
-	__s32		mtu6;
-	__s32		forwarding;
-	__s32		force_forwarding;
-	__s32		disable_policy;
-	__s32		proxy_ndp;
-	__cacheline_group_end(ipv6_devconf_read_txrx);
-
-	__s32		accept_ra;
-	__s32		accept_redirects;
-	__s32		autoconf;
-	__s32		dad_transmits;
-	__s32		rtr_solicits;
-	__s32		rtr_solicit_interval;
-	__s32		rtr_solicit_max_interval;
-	__s32		rtr_solicit_delay;
-	__s32		force_mld_version;
-	__s32		mldv1_unsolicited_report_interval;
-	__s32		mldv2_unsolicited_report_interval;
-	__s32		use_tempaddr;
-	__s32		temp_valid_lft;
-	__s32		temp_prefered_lft;
-	__s32		regen_min_advance;
-	__s32		regen_max_retry;
-	__s32		max_desync_factor;
-	__s32		max_addresses;
-	__s32		accept_ra_defrtr;
-	__u32		ra_defrtr_metric;
-	__s32		accept_ra_min_hop_limit;
-	__s32		accept_ra_min_lft;
-	__s32		accept_ra_pinfo;
-	__s32		ignore_routes_with_linkdown;
-#ifdef CONFIG_IPV6_ROUTER_PREF
-	__s32		accept_ra_rtr_pref;
-	__s32		rtr_probe_interval;
-#ifdef CONFIG_IPV6_ROUTE_INFO
-	__s32		accept_ra_rt_info_min_plen;
-	__s32		accept_ra_rt_info_max_plen;
-#endif
-#endif
-	__s32		accept_source_route;
-	__s32		accept_ra_from_local;
-#ifdef CONFIG_IPV6_OPTIMISTIC_DAD
-	__s32		optimistic_dad;
-	__s32		use_optimistic;
-#endif
-#ifdef CONFIG_IPV6_MROUTE
-	atomic_t	mc_forwarding;
-#endif
-	__s32		drop_unicast_in_l2_multicast;
-	__s32		accept_dad;
-	__s32		force_tllao;
-	__s32           ndisc_notify;
-	__s32		suppress_frag_ndisc;
-	__s32		accept_ra_mtu;
-	__s32		drop_unsolicited_na;
-	__s32		accept_untracked_na;
-	struct ipv6_stable_secret {
-		bool initialized;
-		struct in6_addr secret;
-	} stable_secret;
-	__s32		use_oif_addrs_only;
-	__s32		keep_addr_on_down;
-	__s32		seg6_enabled;
-#ifdef CONFIG_IPV6_SEG6_HMAC
-	__s32		seg6_require_hmac;
-#endif
-	__u32		enhanced_dad;
-	__u32		addr_gen_mode;
-	__s32           ndisc_tclass;
-	__s32		rpl_seg_enabled;
-	__u32		ioam6_id;
-	__u32		ioam6_id_wide;
-	__u8		ioam6_enabled;
-	__u8		ndisc_evict_nocarrier;
-	__u8		ra_honor_pio_life;
-	__u8		ra_honor_pio_pflag;
-	__u8		use_nexthop_prefixes;
-
-	struct ctl_table_header *sysctl_header;
-};
-
-struct ipv6_params {
-	__s32 disable_ipv6;
-	__s32 autoconf;
-};
-extern struct ipv6_params ipv6_defaults;
-#include <linux/tcp.h>
-#include <linux/udp.h>
-
-#include <net/inet_sock.h>
-
-static inline struct ipv6hdr *ipv6_hdr(const struct sk_buff *skb)
-{
-	return (struct ipv6hdr *)skb_network_header(skb);
-}
-
-static inline struct ipv6hdr *inner_ipv6_hdr(const struct sk_buff *skb)
-{
-	return (struct ipv6hdr *)skb_inner_network_header(skb);
-}
-
-static inline struct ipv6hdr *ipipv6_hdr(const struct sk_buff *skb)
-{
-	return (struct ipv6hdr *)skb_transport_header(skb);
-}
-
-static inline unsigned int ipv6_transport_len(const struct sk_buff *skb)
-{
-	return ntohs(ipv6_hdr(skb)->payload_len) + sizeof(struct ipv6hdr) -
-	       skb_network_header_len(skb);
-}
-
-static inline unsigned int
-ipv6_payload_len(const struct sk_buff *skb, const struct ipv6hdr *ip6)
-{
-	u32 len = ntohs(ip6->payload_len);
-
-	return (len || !skb_is_gso(skb) || !skb_is_gso_tcp(skb)) ?
-		len :
-		skb->len - skb_network_offset(skb) - sizeof(struct ipv6hdr);
-}
-
-static inline unsigned int skb_ipv6_payload_len(const struct sk_buff *skb)
-{
-	return ipv6_payload_len(skb, ipv6_hdr(skb));
-}
-
-#define IPV6_MAXPLEN		65535
-
-static inline void ipv6_set_payload_len(struct ipv6hdr *ip6, unsigned int len)
-{
-	ip6->payload_len = len <= IPV6_MAXPLEN ? htons(len) : 0;
-}
-
-/* 
-   This structure contains results of exthdrs parsing
-   as offsets from skb->nh.
+ * ipv6 in net namespaces
  */
 
-struct inet6_skb_parm {
-	int			iif;
-	__be16			ra;
-	__u16			dst0;
-	__u16			srcrt;
-	__u16			dst1;
-	__u16			lastopt;
-	__u16			nhoff;
-	__u16			flags;
-#if defined(CONFIG_IPV6_MIP6) || defined(CONFIG_IPV6_MIP6_MODULE)
-	__u16			dsthao;
-#endif
-	__u16			frag_max_size;
-	__u16			srhoff;
+#include <net/inet_frag.h>
 
-#define IP6SKB_XFRM_TRANSFORMED	1
-#define IP6SKB_FORWARDED	2
-#define IP6SKB_REROUTED		4
-#define IP6SKB_ROUTERALERT	8
-#define IP6SKB_FRAGMENTED      16
-#define IP6SKB_HOPBYHOP        32
-#define IP6SKB_L3SLAVE         64
-#define IP6SKB_JUMBOGRAM      128
-#define IP6SKB_SEG6	      256
-#define IP6SKB_MULTIPATH      1024
-#define IP6SKB_MCROUTE        2048
+#ifndef __NETNS_IPV6_H__
+#define __NETNS_IPV6_H__
+#include <net/dst_ops.h>
+#include <uapi/linux/icmpv6.h>
+
+struct ctl_table_header;
+
+struct netns_sysctl_ipv6 {
+#ifdef CONFIG_SYSCTL
+	struct ctl_table_header *hdr;
+	struct ctl_table_header *route_hdr;
+	struct ctl_table_header *icmp_hdr;
+	struct ctl_table_header *frags_hdr;
+	struct ctl_table_header *xfrm6_hdr;
+#endif
+	int flush_delay;
+	int ip6_rt_max_size;
+	int ip6_rt_gc_min_interval;
+	int ip6_rt_gc_timeout;
+	int ip6_rt_gc_interval;
+	int ip6_rt_gc_elasticity;
+	int ip6_rt_mtu_expires;
+	int ip6_rt_min_advmss;
+	u32 multipath_hash_fields;
+	u8 multipath_hash_policy;
+
+	__cacheline_group_begin(sysctl_ipv6_flowlabel);
+	u8 flowlabel_consistency;
+	u8 auto_flowlabels;
+	u8 flowlabel_state_ranges;
+	__cacheline_group_end(sysctl_ipv6_flowlabel);
+
+	u8 icmpv6_echo_ignore_all;
+	u8 icmpv6_echo_ignore_multicast;
+	u8 icmpv6_echo_ignore_anycast;
+	int icmpv6_time;
+	DECLARE_BITMAP(icmpv6_ratemask, ICMPV6_MSG_MAX + 1);
+	unsigned long *icmpv6_ratemask_ptr;
+	u8 anycast_src_echo_reply;
+	u8 bindv6only;
+	u8 ip_nonlocal_bind;
+	u8 fwmark_reflect;
+	int idgen_retries;
+	int idgen_delay;
+	int flowlabel_reflect;
+	int max_dst_opts_cnt;
+	int max_hbh_opts_cnt;
+	int max_dst_opts_len;
+	int max_hbh_opts_len;
+	int seg6_flowlabel;
+	u32 ioam6_id;
+	u64 ioam6_id_wide;
+	u8 skip_notify_on_dev_down;
+	u8 fib_notify_on_flag_change;
+	u8 icmpv6_error_anycast_as_unicast;
+	u8 icmpv6_errors_extension_mask;
 };
 
-#if defined(CONFIG_NET_L3_MASTER_DEV)
-static inline bool ipv6_l3mdev_skb(__u16 flags)
-{
-	return flags & IP6SKB_L3SLAVE;
-}
-#else
-static inline bool ipv6_l3mdev_skb(__u16 flags)
-{
-	return false;
-}
-#endif
+struct netns_ipv6 {
+	/* Keep ip6_dst_ops at the beginning of netns_sysctl_ipv6 */
+	struct dst_ops		ip6_dst_ops;
 
-#define IP6CB(skb)	((struct inet6_skb_parm*)((skb)->cb))
-#define IP6CBMTU(skb)	((struct ip6_mtuinfo *)((skb)->cb))
-
-static inline int inet6_iif(const struct sk_buff *skb)
-{
-	bool l3_slave = ipv6_l3mdev_skb(IP6CB(skb)->flags);
-
-	return l3_slave ? skb->skb_iif : IP6CB(skb)->iif;
-}
-
-static inline bool inet6_is_jumbogram(const struct sk_buff *skb)
-{
-	return !!(IP6CB(skb)->flags & IP6SKB_JUMBOGRAM);
-}
-
-/* can not be used in TCP layer after tcp_v6_fill_cb */
-static inline int inet6_sdif(const struct sk_buff *skb)
-{
-#if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
-	if (skb && ipv6_l3mdev_skb(IP6CB(skb)->flags))
-		return IP6CB(skb)->iif;
-#endif
-	return 0;
-}
-
-struct tcp6_request_sock {
-	struct tcp_request_sock	  tcp6rsk_tcp;
-};
-
-struct ipv6_mc_socklist;
-struct ipv6_ac_socklist;
-struct ipv6_fl_socklist;
-
-/* struct ipv6_pinfo - ipv6 private area */
-struct ipv6_pinfo {
-	/* Used in tx path (inet6_csk_route_socket(), ip6_xmit()) */
-	struct in6_addr 	saddr;
-	union {
-		struct in6_addr daddr;
-		struct in6_addr final;
-	};
-	__be32			flow_label;
-	u32			dst_cookie;
-	struct ipv6_txoptions __rcu	*opt;
-	s16			hop_limit;
-	u8			pmtudisc;
-	u8			tclass;
+	struct netns_sysctl_ipv6 sysctl;
+	struct ipv6_devconf	*devconf_all;
+	struct ipv6_devconf	*devconf_dflt;
+	struct inet_peer_base	*peers;
+	struct fqdir		*fqdir;
+	struct fib6_info	*fib6_null_entry;
+	struct rt6_info		*ip6_null_entry;
+	struct rt6_statistics   *rt6_stats;
+	struct timer_list       ip6_fib_timer;
+	struct hlist_head       *fib_table_hash;
+	spinlock_t		fib_table_hash_lock;
+	struct fib6_table       *fib6_main_tbl;
+	struct list_head	fib6_walkers;
+	rwlock_t		fib6_walker_lock;
+	spinlock_t		fib6_gc_lock;
+	atomic_t		ip6_rt_gc_expire;
+	unsigned long		ip6_rt_last_gc;
+	unsigned char		flowlabel_has_excl;
+#ifdef CONFIG_IPV6_MULTIPLE_TABLES
+	bool			fib6_has_custom_rules;
+	unsigned int		fib6_rules_require_fldissect;
 #ifdef CONFIG_IPV6_SUBTREES
-	bool			saddr_cache;
+	unsigned int		fib6_routes_require_src;
 #endif
-	bool			daddr_cache;
+	struct rt6_info         *ip6_prohibit_entry;
+	struct rt6_info         *ip6_blk_hole_entry;
+	struct fib6_table       *fib6_local_tbl;
+	struct fib_rules_ops    *fib6_rules_ops;
+#endif
+	struct sock             *ndisc_sk;
+	struct sock             *tcp_sk;
+	struct sock             *igmp_sk;
+	struct sock		*mc_autojoin_sk;
 
-	u8			mcast_hops;
-	u32			frag_size;
+	struct hlist_head	*inet6_addr_lst;
+	spinlock_t		addrconf_hash_lock;
+	struct delayed_work	addr_chk_work;
 
-	int			ucast_oif;
-	int			mcast_oif;
-
-	/* pktoption flags */
-	union {
-		struct {
-			u16	srcrt:1,
-				osrcrt:1,
-			        rxinfo:1,
-			        rxoinfo:1,
-				rxhlim:1,
-				rxohlim:1,
-				hopopts:1,
-				ohopopts:1,
-				dstopts:1,
-				odstopts:1,
-                                rxflow:1,
-				rxtclass:1,
-				rxpmtu:1,
-				rxorigdstaddr:1,
-				recvfragsize:1;
-				/* 1 bits hole */
-		} bits;
-		u16		all;
-	} rxopt;
-
-	/* sockopt flags */
-	u8			srcprefs;	/* 001: prefer temporary address
-						 * 010: prefer public address
-						 * 100: prefer care-of address
-						 */
-	u8			min_hopcount;
-	__be32			rcv_flowinfo;
-	struct in6_pktinfo	sticky_pktinfo;
-
-	struct sk_buff		*pktoptions;
-	struct sk_buff		*rxpmtu;
-
-	struct ipv6_mc_socklist	__rcu *ipv6_mc_list;
-	struct ipv6_ac_socklist	*ipv6_ac_list;
-};
-
-/* We currently use available bits from inet_sk(sk)->inet_flags,
- * this could change in the future.
- */
-#define inet6_test_bit(nr, sk)			\
-	test_bit(INET_FLAGS_##nr, &inet_sk(sk)->inet_flags)
-#define inet6_set_bit(nr, sk)			\
-	set_bit(INET_FLAGS_##nr, &inet_sk(sk)->inet_flags)
-#define inet6_clear_bit(nr, sk)			\
-	clear_bit(INET_FLAGS_##nr, &inet_sk(sk)->inet_flags)
-#define inet6_assign_bit(nr, sk, val)		\
-	assign_bit(INET_FLAGS_##nr, &inet_sk(sk)->inet_flags, val)
-
-/* WARNING: don't change the layout of the members in {raw,udp,tcp}6_sock! */
-struct raw6_sock {
-	/* inet_sock has to be the first member of raw6_sock */
-	struct inet_sock	inet;
-	__u32			checksum;	/* perform checksum */
-	__u32			offset;		/* checksum offset  */
-	struct icmp6_filter	filter;
-	__u32			ip6mr_table;
-	struct numa_drop_counters drop_counters;
-	struct ipv6_pinfo	inet6;
-};
-
-struct udp6_sock {
-	struct udp_sock	  udp;
-
-	struct ipv6_pinfo inet6;
-};
-
-struct tcp6_sock {
-	struct tcp_sock	  tcp;
-
-	struct ipv6_pinfo inet6;
-};
-
-extern int inet6_sk_rebuild_header(struct sock *sk);
-
-struct tcp6_timewait_sock {
-	struct tcp_timewait_sock   tcp6tw_tcp;
-};
-
-#if IS_ENABLED(CONFIG_IPV6)
-extern int disable_ipv6_mod;
-
-static inline bool ipv6_mod_enabled(void)
-{
-	return disable_ipv6_mod == 0;
-}
-
-static inline struct ipv6_pinfo *inet6_sk(const struct sock *__sk)
-{
-	return sk_fullsock(__sk) ? inet_sk(__sk)->pinet6 : NULL;
-}
-
-#define raw6_sk(ptr) container_of_const(ptr, struct raw6_sock, inet.sk)
-
-#define ipv6_only_sock(sk)	(sk->sk_ipv6only)
-#define ipv6_sk_rxinfo(sk)	((sk)->sk_family == PF_INET6 && \
-				 inet6_sk(sk)->rxopt.bits.rxinfo)
-
-static inline const struct in6_addr *inet6_rcv_saddr(const struct sock *sk)
-{
-	if (sk->sk_family == AF_INET6)
-		return &sk->sk_v6_rcv_saddr;
-	return NULL;
-}
-
-static inline int inet_v6_ipv6only(const struct sock *sk)
-{
-	/* ipv6only field is at same position for timewait and other sockets */
-	return ipv6_only_sock(sk);
-}
+#ifdef CONFIG_IPV6_MROUTE
+#ifndef CONFIG_IPV6_MROUTE_MULTIPLE_TABLES
+	struct mr_table		*mrt6;
 #else
-#define ipv6_only_sock(sk)	0
-#define ipv6_sk_rxinfo(sk)	0
+	struct list_head	mr6_tables;
+	struct fib_rules_ops	*mr6_rules_ops;
+#endif
+	struct fib_notifier_ops	*ip6mr_notifier_ops;
+	atomic_t		ipmr_seq;
+	struct mutex		mfc_mutex;
+#endif
+	atomic_t		dev_addr_genid;
+	atomic_t		adv_prefixes;	/* entries of all devices */
+	atomic_t		fib6_sernum;
+	struct seg6_pernet_data *seg6_data;
+	struct fib_notifier_ops	*notifier_ops;
+	int			flowlabel_count;
+	struct {
+		struct hlist_head head;
+		spinlock_t	lock;
+		u32		seq;
+		struct work_struct kl_work;	/* known-local ULA entries */
+	} ip6addrlbl_table;
+	struct ioam6_pernet_data *ioam6_data;
+};
 
-static inline bool ipv6_mod_enabled(void)
-{
-	return false;
-}
+#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
+struct netns_nf_frag {
+	struct fqdir	*fqdir;
+};
+#endif
 
-static inline struct ipv6_pinfo * inet6_sk(const struct sock *__sk)
-{
-	return NULL;
-}
-
-static inline struct raw6_sock *raw6_sk(const struct sock *sk)
-{
-	return NULL;
-}
-
-#define inet6_rcv_saddr(__sk)	NULL
-#define inet_v6_ipv6only(__sk)		0
-#endif /* IS_ENABLED(CONFIG_IPV6) */
-#endif /* _IPV6_H */
+#endif

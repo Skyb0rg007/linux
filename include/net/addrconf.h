@@ -243,6 +243,19 @@ static inline int addrconf_finite_timeout(unsigned long timeout)
 int ipv6_addr_label_init(void);
 void ipv6_addr_label_cleanup(void);
 int ipv6_addr_label_rtnl_register(void);
+
+/* Known-local ULA prefixes (draft-ietf-6man-rfc6724-update section 3.3) */
+#define IP6ADDRLBL_KL_MAX	32	/* per interface */
+
+struct ip6addrlbl_kl {
+	struct in6_addr	prefix;
+	int		prefixlen;
+};
+
+void ip6addrlbl_kl_sync(struct net *net, int ifindex,
+			const struct ip6addrlbl_kl *set, int n);
+void addrconf_kl_work(struct work_struct *work);
+void addrconf_kl_mark_all(struct net *net);
 u32 ipv6_addr_label(struct net *net, const struct in6_addr *addr,
 		    int type, int ifindex);
 u32 ipv6_addr_precedence(struct net *net, const struct in6_addr *addr,

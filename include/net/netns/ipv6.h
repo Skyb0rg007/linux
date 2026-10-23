@@ -126,6 +126,7 @@ struct netns_ipv6 {
 		struct hlist_head head;
 		spinlock_t	lock;
 		u32		seq;
+		struct work_struct kl_work;	/* known-local ULA entries */
 	} ip6addrlbl_table;
 	struct ioam6_pernet_data *ioam6_data;
 };

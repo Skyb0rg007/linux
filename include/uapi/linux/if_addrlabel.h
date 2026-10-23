@@ -22,6 +22,11 @@ struct ifaddrlblmsg {
 	__u32		ifal_seq;		/* sequence number */
 };
 
+/* ifal_flags, set by the kernel in dumps and notifications */
+#define IFAL_F_KNOWN_LOCAL	0x01	/* entry of a known-local ULA prefix
+					 * (net.ipv6.conf.*.known_local_ula)
+					 */
+
 enum {
 	IFAL_ADDRESS = 1,
 	IFAL_LABEL = 2,

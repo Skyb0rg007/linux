@@ -2990,6 +2990,44 @@ use_nexthop_prefixes - BOOLEAN
 
 	Default: 1 (enabled)
 
+known_local_ula - BOOLEAN
+	Add the known-local ULA prefixes of this interface to the address
+	selection policy table, with label 14 and precedence 45
+	(draft-ietf-6man-rfc6724-update section 3.3), so that ULA source
+	and destination pairs within the site are preferred over IPv4 and
+	global addresses, but not other ULAs.
+
+	A prefix under fd00::/8 is known-local when a Route Information
+	Option of length /40 or longer that the interface accepts (see
+	accept_ra_rt_info_max_plen) advertises it, or, as its /48, when a
+	Prefix Information Option advertises it, whatever its flags, or the
+	interface has an address in it, unless the options come from SNAC
+	routers. Prefixes that the Route Information Options cover are not
+	added again for options or addresses.
+
+	The entries are for the interface, flagged IFAL_F_KNOWN_LOCAL with
+	protocol kernel, and follow the addresses, and the options until
+	their valid lifetime ends. An entry of the administrator for a ULA
+	prefix longer than fc00::/7 keeps them out of the prefixes it covers.
+	Removing an entry lasts until the known-local prefixes of the
+	interface change. At most 32 entries are added per interface.
+
+	Note that this changes source address selection, not only for
+	known-local destinations: rule 6 (prefer matching label) no longer
+	prefers a known-local ULA source for other ULA destinations.
+
+	The behaviour is enabled on an interface when both
+	conf/all/known_local_ula and conf/<interface>/known_local_ula are
+	enabled. Writing conf/all/known_local_ula does not change the
+	value of the interfaces. It also applies to forwarding interfaces.
+
+	Possible values:
+
+	- 0 (disabled)
+	- 1 (enabled)
+
+	Default: 0 (disabled)
+
 use_tempaddr - INTEGER
 	Preference for Privacy Extensions (RFC3041).
 
