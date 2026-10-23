@@ -31,6 +31,7 @@ struct ip6addrlbl_entry {
 	u32 label;
 	u32 precedence;
 	u8 protocol;
+	u8 flags;		/* IFAL_F_* */
 	struct hlist_node list;
 	struct rcu_head rcu;
 };
@@ -58,6 +59,11 @@ struct ip6addrlbl_entry {
  *	 draft-ietf-6man-rfc6724-update. The kernel does not use them itself,
  *	 they are exported for destination address selection in userspace,
  *	 see IPV6_ADDR_SELECTION.
+ * Note: With net.ipv6.conf.*.known_local_ula, the kernel adds an entry with
+ *	 label 14 and precedence 45 for each known-local ULA prefix of an
+ *	 interface (draft-ietf-6man-rfc6724-update section 3.3), flagged
+ *	 IFAL_F_KNOWN_LOCAL, unless an entry of the administrator for a ULA
+ *	 prefix covers it. These entries apply to all interfaces.
  * Note: An entry for all interfaces added without a precedence for one of
  *	 these prefixes gets the precedence listed here, so that changing
  *	 only the label of e.g. ::/0 leaves its precedence alone.
@@ -65,6 +71,10 @@ struct ip6addrlbl_entry {
 
 #define IPV6_ADDR_LABEL_DEFAULT	0xffffffffUL
 #define IPV6_ADDR_PRECEDENCE_NONE	0xffffffffUL
+
+/* draft-ietf-6man-rfc6724-update section 3.3, rule 6 */
+#define IPV6_ADDR_KL_LABEL		14
+#define IPV6_ADDR_KL_PRECEDENCE		45
 
 static const struct ip6addrlbl_init_table
 {
@@ -125,12 +135,16 @@ static const struct ip6addrlbl_init_table
 	}
 };
 
-/* Find label */
+/* Find label. Known-local entries apply to all interfaces, like the
+ * policy table of draft-ietf-6man-rfc6724-update: their ifindex is the
+ * interface that the prefix is known on.
+ */
 static bool __ip6addrlbl_match(const struct ip6addrlbl_entry *p,
 			       const struct in6_addr *addr,
 			       int addrtype, int ifindex)
 {
-	if (p->ifindex && p->ifindex != ifindex)
+	if (p->ifindex && p->ifindex != ifindex &&
+	    !(p->flags & IFAL_F_KNOWN_LOCAL))
 		return false;
 	if (p->addrtype && p->addrtype != addrtype)
 		return false;
@@ -201,7 +215,7 @@ u32 ipv6_addr_precedence(struct net *net, const struct in6_addr *addr,
 static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 						 int prefixlen, int ifindex,
 						 u32 label, u32 precedence,
-						 u8 protocol)
+						 u8 protocol, u8 flags)
 {
 	struct ip6addrlbl_entry *newp;
 	int addrtype;
@@ -239,8 +253,39 @@ static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 	newp->label = label;
 	newp->precedence = precedence;
 	newp->protocol = protocol;
+	newp->flags = flags;
 	INIT_HLIST_NODE(&newp->list);
 	return newp;
+}
+
+/* Entries for known-local prefixes have their own key, so that the
+ * administrator does not run into them.
+ */
+static bool ip6addrlbl_same_key(const struct ip6addrlbl_entry *p,
+				const struct in6_addr *prefix, int prefixlen,
+				int ifindex, u8 flags)
+{
+	return p->prefixlen == prefixlen && p->ifindex == ifindex &&
+	       !((p->flags ^ flags) & IFAL_F_KNOWN_LOCAL) &&
+	       ipv6_addr_equal(&p->prefix, prefix);
+}
+
+/* An entry of the administrator for a ULA prefix, more specific than the
+ * fc00::/7 of the default table, keeps known-local entries out of the
+ * prefixes it covers, whatever its interface, since those apply to all
+ * interfaces.
+ */
+static bool ip6addrlbl_is_ula_policy(const struct ip6addrlbl_entry *p)
+{
+	return !(p->flags & IFAL_F_KNOWN_LOCAL) && p->prefixlen > 7 &&
+	       (p->prefix.s6_addr[0] & 0xfe) == 0xfc;
+}
+
+static bool ip6addrlbl_covers(const struct ip6addrlbl_entry *p,
+			      const struct in6_addr *prefix, int prefixlen)
+{
+	return p->prefixlen <= prefixlen &&
+	       ipv6_prefix_equal(&p->prefix, prefix, p->prefixlen);
 }
 
 /* add a label */
@@ -257,9 +302,8 @@ static int __ip6addrlbl_add(struct net *net, struct ip6addrlbl_entry *newp,
 	 * point.
 	 */
 	hlist_for_each_entry(p, &net->ipv6.ip6addrlbl_table.head, list) {
-		if (p->prefixlen == newp->prefixlen &&
-		    p->ifindex == newp->ifindex &&
-		    ipv6_addr_equal(&p->prefix, &newp->prefix)) {
+		if (ip6addrlbl_same_key(p, &newp->prefix, newp->prefixlen,
+					newp->ifindex, newp->flags)) {
 			if (!replace) {
 				ret = -EEXIST;
 				goto out;
@@ -290,10 +334,13 @@ out:
 }
 
 static struct sk_buff *ip6addrlbl_notify_alloc(struct net *net,
-					       const struct nlmsghdr *nlh);
+					       const struct nlmsghdr *nlh,
+					       gfp_t gfp);
 static void ip6addrlbl_notify(struct net *net, struct sk_buff *skb,
 			      const struct ip6addrlbl_entry *p, int event,
 			      const struct nlmsghdr *nlh, u32 portid);
+static void ip6addrlbl_kl_override(struct net *net,
+				   const struct ip6addrlbl_entry *newp);
 
 /* add a label */
 static int ip6addrlbl_add(struct net *net,
@@ -309,15 +356,18 @@ static int ip6addrlbl_add(struct net *net,
 			    __func__, prefix, prefixlen, ifindex, (unsigned int)label, replace);
 
 	newp = ip6addrlbl_alloc(prefix, prefixlen, ifindex, label, precedence,
-				protocol);
+				protocol, 0);
 	if (IS_ERR(newp))
 		return PTR_ERR(newp);
-	skb = ip6addrlbl_notify_alloc(net, nlh);
+	skb = ip6addrlbl_notify_alloc(net, nlh, GFP_KERNEL);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
 	ret = __ip6addrlbl_add(net, newp, replace);
-	if (!ret)
+	if (!ret) {
 		ip6addrlbl_notify(net, skb, newp, RTM_NEWADDRLABEL, nlh,
 				  portid);
+		if (ip6addrlbl_is_ula_policy(newp))
+			ip6addrlbl_kl_override(net, newp);
+	}
 	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
 	if (ret) {
 		kfree_skb(skb);
@@ -326,11 +376,26 @@ static int ip6addrlbl_add(struct net *net,
 	return ret;
 }
 
-/* remove a label */
+static void __ip6addrlbl_unlink(struct net *net, struct ip6addrlbl_entry *p,
+				struct sk_buff *skb, const struct nlmsghdr *nlh,
+				u32 portid)
+{
+	hlist_del_rcu(&p->list);
+	WRITE_ONCE(net->ipv6.ip6addrlbl_table.seq,
+		   net->ipv6.ip6addrlbl_table.seq + 1);
+	ip6addrlbl_notify(net, skb, p, RTM_DELADDRLABEL, nlh, portid);
+	kfree_rcu(p, rcu);
+}
+
+/* remove a label. Removing the entry of a known-local prefix lasts until the
+ * known-local prefixes of the interface change, like for an address
+ * configured by SLAAC.
+ */
 static int __ip6addrlbl_del(struct net *net,
 			    const struct in6_addr *prefix, int prefixlen,
 			    int ifindex, u8 protocol, struct sk_buff *skb,
-			    const struct nlmsghdr *nlh, u32 portid)
+			    const struct nlmsghdr *nlh, u32 portid,
+			    bool *ula_policy)
 {
 	struct ip6addrlbl_entry *p = NULL;
 	struct hlist_node *n;
@@ -345,12 +410,8 @@ static int __ip6addrlbl_del(struct net *net,
 		    ipv6_addr_equal(&p->prefix, prefix)) {
 			if (protocol && p->protocol != protocol)
 				break;
-			hlist_del_rcu(&p->list);
-			WRITE_ONCE(net->ipv6.ip6addrlbl_table.seq,
-				   net->ipv6.ip6addrlbl_table.seq + 1);
-			ip6addrlbl_notify(net, skb, p, RTM_DELADDRLABEL, nlh,
-					  portid);
-			kfree_rcu(p, rcu);
+			*ula_policy = ip6addrlbl_is_ula_policy(p);
+			__ip6addrlbl_unlink(net, p, skb, nlh, portid);
 			ret = 0;
 			break;
 		}
@@ -364,6 +425,7 @@ static int ip6addrlbl_del(struct net *net,
 			  int ifindex, u8 protocol, const struct nlmsghdr *nlh,
 			  u32 portid)
 {
+	bool ula_policy = false;
 	struct in6_addr prefix_buf;
 	struct sk_buff *skb;
 	int ret;
@@ -372,13 +434,16 @@ static int ip6addrlbl_del(struct net *net,
 			    prefixlen, ifindex);
 
 	ipv6_addr_prefix(&prefix_buf, prefix, prefixlen);
-	skb = ip6addrlbl_notify_alloc(net, nlh);
+	skb = ip6addrlbl_notify_alloc(net, nlh, GFP_KERNEL);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
 	ret = __ip6addrlbl_del(net, &prefix_buf, prefixlen, ifindex, protocol,
-			       skb, nlh, portid);
+			       skb, nlh, portid, &ula_policy);
 	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
 	if (ret)
 		kfree_skb(skb);
+	/* Bring back the known-local entries that it kept out */
+	if (ula_policy)
+		addrconf_kl_mark_all(net);
 	return ret;
 }
 
@@ -392,6 +457,7 @@ static int __net_init ip6addrlbl_net_init(struct net *net)
 
 	spin_lock_init(&net->ipv6.ip6addrlbl_table.lock);
 	INIT_HLIST_HEAD(&net->ipv6.ip6addrlbl_table.head);
+	INIT_WORK(&net->ipv6.ip6addrlbl_table.kl_work, addrconf_kl_work);
 
 	for (i = 0; i < ARRAY_SIZE(ip6addrlbl_init_table); i++) {
 		err = ip6addrlbl_add(net,
@@ -418,6 +484,8 @@ static void __net_exit ip6addrlbl_net_exit(struct net *net)
 {
 	struct ip6addrlbl_entry *p = NULL;
 	struct hlist_node *n;
+
+	cancel_work_sync(&net->ipv6.ip6addrlbl_table.kl_work);
 
 	/* Remove all labels belonging to the exiting net */
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
@@ -553,13 +621,13 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 }
 
 static void ip6addrlbl_putmsg(struct nlmsghdr *nlh,
-			      int prefixlen, int ifindex, u32 lseq)
+			      int prefixlen, int ifindex, u32 lseq, u8 flags)
 {
 	struct ifaddrlblmsg *ifal = nlmsg_data(nlh);
 	ifal->ifal_family = AF_INET6;
 	ifal->__ifal_reserved = 0;
 	ifal->ifal_prefixlen = prefixlen;
-	ifal->ifal_flags = 0;
+	ifal->ifal_flags = flags;
 	ifal->ifal_index = ifindex;
 	ifal->ifal_seq = lseq;
 };
@@ -575,7 +643,7 @@ static int ip6addrlbl_fill(struct sk_buff *skb,
 	if (!nlh)
 		return -EMSGSIZE;
 
-	ip6addrlbl_putmsg(nlh, p->prefixlen, p->ifindex, lseq);
+	ip6addrlbl_putmsg(nlh, p->prefixlen, p->ifindex, lseq, p->flags);
 
 	if (nla_put_in6_addr(skb, IFAL_ADDRESS, &p->prefix) < 0 ||
 	    nla_put_u32(skb, IFAL_LABEL, p->label) < 0 ||
@@ -662,10 +730,11 @@ static inline int ip6addrlbl_msgsize(void)
 }
 
 /* Allocated before taking the lock of the table, so that the notifications
- * are sent in the order of the changes.
+ * are sent in the order of the changes, or with GFP_ATOMIC under it.
  */
 static struct sk_buff *ip6addrlbl_notify_alloc(struct net *net,
-					       const struct nlmsghdr *nlh)
+					       const struct nlmsghdr *nlh,
+					       gfp_t gfp)
 {
 	struct sk_buff *skb;
 
@@ -673,7 +742,7 @@ static struct sk_buff *ip6addrlbl_notify_alloc(struct net *net,
 				RTNLGRP_IPV6_ADDRLABEL))
 		return NULL;
 
-	skb = nlmsg_new(ip6addrlbl_msgsize(), GFP_KERNEL);
+	skb = nlmsg_new(ip6addrlbl_msgsize(), gfp);
 	if (!skb)
 		rtnl_set_sk_err(net, RTNLGRP_IPV6_ADDRLABEL, -ENOBUFS);
 	return skb;
@@ -701,6 +770,142 @@ static void ip6addrlbl_notify(struct net *net, struct sk_buff *skb,
 	}
 
 	rtnl_notify(skb, net, portid, RTNLGRP_IPV6_ADDRLABEL, nlh, GFP_ATOMIC);
+}
+
+/* Remove an entry of the kernel, under the lock of the table */
+static void ip6addrlbl_kl_unlink(struct net *net, struct ip6addrlbl_entry *p)
+{
+	__ip6addrlbl_unlink(net, p,
+			    ip6addrlbl_notify_alloc(net, NULL, GFP_ATOMIC),
+			    NULL, 0);
+}
+
+static struct ip6addrlbl_entry *
+ip6addrlbl_kl_find(struct net *net, const struct in6_addr *prefix,
+		   int prefixlen, int ifindex)
+{
+	struct ip6addrlbl_entry *p;
+
+	hlist_for_each_entry(p, &net->ipv6.ip6addrlbl_table.head, list) {
+		if (ip6addrlbl_same_key(p, prefix, prefixlen, ifindex,
+					IFAL_F_KNOWN_LOCAL))
+			return p;
+	}
+	return NULL;
+}
+
+static bool ip6addrlbl_kl_overridden(struct net *net,
+				     const struct in6_addr *prefix,
+				     int prefixlen)
+{
+	struct ip6addrlbl_entry *p;
+
+	hlist_for_each_entry(p, &net->ipv6.ip6addrlbl_table.head, list) {
+		if (ip6addrlbl_is_ula_policy(p) &&
+		    ip6addrlbl_covers(p, prefix, prefixlen))
+			return true;
+	}
+	return false;
+}
+
+/* Remove the known-local entries that the new entry @newp of the
+ * administrator covers.
+ */
+static void ip6addrlbl_kl_override(struct net *net,
+				   const struct ip6addrlbl_entry *newp)
+{
+	struct ip6addrlbl_entry *p;
+	struct hlist_node *n;
+
+	lockdep_assert_held(&net->ipv6.ip6addrlbl_table.lock);
+
+	hlist_for_each_entry_safe(p, n, &net->ipv6.ip6addrlbl_table.head, list) {
+		if ((p->flags & IFAL_F_KNOWN_LOCAL) &&
+		    ip6addrlbl_covers(newp, &p->prefix, p->prefixlen)) {
+			ip6addrlbl_kl_unlink(net, p);
+		}
+	}
+}
+
+static bool ip6addrlbl_kl_in_set(const struct ip6addrlbl_entry *p,
+				 const struct ip6addrlbl_kl *set, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (p->prefixlen == set[i].prefixlen &&
+		    ipv6_addr_equal(&p->prefix, &set[i].prefix))
+			return true;
+	}
+	return false;
+}
+
+/**
+ * ip6addrlbl_kl_sync - set the known-local ULA entries of an interface
+ * @net: network namespace
+ * @ifindex: interface
+ * @set: the known-local prefixes of the interface, already masked
+ * @n: number of prefixes in @set, at most %IP6ADDRLBL_KL_MAX
+ *
+ * Entries for prefixes not in @set are removed, missing ones are added
+ * unless an entry of the administrator covers them, and each change is
+ * notified.
+ *
+ * Context: process context, serialised by the caller.
+ */
+void ip6addrlbl_kl_sync(struct net *net, int ifindex,
+			const struct ip6addrlbl_kl *set, int n)
+{
+	struct ip6addrlbl_entry *newp[IP6ADDRLBL_KL_MAX] = {};
+	DECLARE_BITMAP(missing, IP6ADDRLBL_KL_MAX) = {};
+	struct ip6addrlbl_entry *p;
+	struct hlist_node *tmp;
+	struct sk_buff *skb;
+	int i;
+
+	n = min(n, IP6ADDRLBL_KL_MAX);
+
+	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
+	for (i = 0; i < n; i++) {
+		if (!ip6addrlbl_kl_find(net, &set[i].prefix, set[i].prefixlen,
+					ifindex))
+			__set_bit(i, missing);
+	}
+	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
+
+	for_each_set_bit(i, missing, n) {
+		newp[i] = ip6addrlbl_alloc(&set[i].prefix, set[i].prefixlen,
+					   ifindex, IPV6_ADDR_KL_LABEL,
+					   IPV6_ADDR_KL_PRECEDENCE,
+					   RTPROT_KERNEL, IFAL_F_KNOWN_LOCAL);
+		if (IS_ERR(newp[i]))
+			newp[i] = NULL;
+	}
+
+	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
+	hlist_for_each_entry_safe(p, tmp, &net->ipv6.ip6addrlbl_table.head,
+				  list) {
+		if (!(p->flags & IFAL_F_KNOWN_LOCAL) || p->ifindex != ifindex)
+			continue;
+		if (!ip6addrlbl_kl_in_set(p, set, n) ||
+		    ip6addrlbl_kl_overridden(net, &p->prefix, p->prefixlen)) {
+			ip6addrlbl_kl_unlink(net, p);
+		}
+	}
+	for (i = 0; i < n; i++) {
+		if (!newp[i] ||
+		    ip6addrlbl_kl_overridden(net, &newp[i]->prefix,
+					     newp[i]->prefixlen) ||
+		    __ip6addrlbl_add(net, newp[i], 0))
+			continue;
+		skb = ip6addrlbl_notify_alloc(net, NULL, GFP_ATOMIC);
+		ip6addrlbl_notify(net, skb, newp[i], RTM_NEWADDRLABEL, NULL, 0);
+		newp[i] = NULL;
+	}
+	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
+
+	for (i = 0; i < n; i++)
+		kfree(newp[i]);
 }
 
 static int ip6addrlbl_valid_get_req(struct sk_buff *skb,

@@ -38,6 +38,7 @@
 
 #include <crypto/sha1.h>
 #include <linux/errno.h>
+#include <linux/sort.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/sched/signal.h>
@@ -243,6 +244,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
 	.use_nexthop_prefixes	= 1,
+	.known_local_ula	= 0,
 };
 
 static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
@@ -309,6 +311,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
 	.use_nexthop_prefixes	= 1,
+	.known_local_ula	= 0,
 };
 
 /* Check if link is ready: is it up and is a valid qdisc available */
@@ -1514,6 +1517,61 @@ out:
 }
 
 /*
+ *	Known-local ULA prefixes (draft-ietf-6man-rfc6724-update section 3.3)
+ */
+
+/* Only defined under fd00::/8 */
+static bool ipv6_addr_kl_candidate(const struct in6_addr *addr, int plen)
+{
+	return plen >= 8 && addr->s6_addr[0] == 0xfd;
+}
+
+static bool addrconf_kl_enabled(const struct inet6_dev *idev)
+{
+	return READ_ONCE(idev->cnf.known_local_ula);
+}
+
+/* Have addrconf_kl_work() compute the known-local prefixes of @idev again,
+ * when the behaviour is enabled, or @force.
+ */
+static void addrconf_kl_mark(struct inet6_dev *idev, bool force)
+{
+	struct net *net = dev_net(idev->dev);
+
+	if (!force && !addrconf_kl_enabled(idev))
+		return;
+
+	set_bit(0, &idev->kl_dirty);
+	schedule_work(&net->ipv6.ip6addrlbl_table.kl_work);
+}
+
+/* Mark all interfaces, after setting their known_local_ula to @val if not
+ * negative.
+ */
+static void __addrconf_kl_mark_all(struct net *net, int val)
+{
+	struct net_device *dev;
+
+	rcu_read_lock();
+	for_each_netdev_rcu(net, dev) {
+		struct inet6_dev *idev = __in6_dev_get(dev);
+
+		if (!idev)
+			continue;
+		if (val >= 0)
+			WRITE_ONCE(idev->cnf.known_local_ula, val);
+		set_bit(0, &idev->kl_dirty);
+	}
+	rcu_read_unlock();
+	schedule_work(&net->ipv6.ip6addrlbl_table.kl_work);
+}
+
+void addrconf_kl_mark_all(struct net *net)
+{
+	__addrconf_kl_mark_all(net, -1);
+}
+
+/*
  *	Prefixes advertised by routers (RFC 8028)
  */
 static void inet6_adv_prefix_notify(struct inet6_dev *idev,
@@ -1559,6 +1617,8 @@ static void inet6_adv_prefix_del(struct inet6_dev *idev,
 
 	hlist_del_rcu(&p->node);
 	(*inet6_adv_prefix_count(idev, p->type))--;
+	if (ipv6_addr_kl_candidate(&p->prefix, p->prefix_len))
+		addrconf_kl_mark(idev, false);
 	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
 	atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes_genid);
 	inet6_adv_prefix_notify(idev, p, RTM_DELPREFIX, nlh, portid);
@@ -1591,7 +1651,7 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 				struct netlink_ext_ack *extack)
 {
 	struct inet6_adv_prefix *p, *new;
-	bool verify, notify = true;
+	bool verify, kl, notify = true;
 	unsigned long timeout;
 	int err = 0;
 
@@ -1625,6 +1685,10 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 				  new->prefix_len, &new->router);
 	if (p && !nlh && p->protocol != new->protocol)
 		goto unlock;
+
+	/* The SNAC Router flag matters to known-local prefixes */
+	kl = ipv6_addr_kl_candidate(&new->prefix, new->prefix_len) &&
+	     (!p || p->ra_flags != new->ra_flags);
 
 	/* addrconf_verify_rtnl() expires the entry, unless it is already
 	 * scheduled to run before.
@@ -1670,6 +1734,8 @@ static int inet6_adv_prefix_set(struct inet6_dev *idev,
 		inet6_adv_prefix_notify(idev, new, RTM_NEWPREFIX, nlh, portid);
 	if (verify)
 		addrconf_verify(dev_net(idev->dev));
+	if (kl)
+		addrconf_kl_mark(idev, false);
 	new = NULL;
 
 unlock:
@@ -1769,6 +1835,154 @@ void addrconf_rio_rcv(struct inet6_dev *idev, const struct route_info *ri,
 		inet6_adv_prefix_remove(idev, ND_OPT_ROUTE_INFO, &tmpl.prefix,
 					tmpl.prefix_len, router, RTPROT_RA,
 					NULL, 0);
+}
+
+static bool addrconf_kl_covered(const struct ip6addrlbl_kl *set, int n,
+				const struct in6_addr *addr, int plen)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		if (set[i].prefixlen <= plen &&
+		    ipv6_prefix_equal(&set[i].prefix, addr, set[i].prefixlen))
+			return true;
+	}
+	return false;
+}
+
+/* Add @addr/@kl_len, unless the list already covers @addr/@plen */
+static void addrconf_kl_add(struct ip6addrlbl_kl *set, int *n,
+			    const struct in6_addr *addr, int plen, int kl_len,
+			    const struct net_device *dev)
+{
+	if (addrconf_kl_covered(set, *n, addr, plen))
+		return;
+
+	if (*n == IP6ADDRLBL_KL_MAX) {
+		net_warn_ratelimited("%s: too many known-local ULA prefixes, ignoring %pI6c/%d\n",
+				     dev->name, addr, kl_len);
+		return;
+	}
+
+	ipv6_addr_prefix(&set[*n].prefix, addr, kl_len);
+	set[*n].prefixlen = kl_len;
+	(*n)++;
+}
+
+static int addrconf_kl_cmp(const void *a, const void *b)
+{
+	const struct ip6addrlbl_kl *x = a, *y = b;
+
+	return x->prefixlen - y->prefixlen;
+}
+
+static bool addrconf_kl_usable(const struct inet6_adv_prefix *p, u8 type)
+{
+	/* Rule 1: ignore the options of SNAC routers */
+	return p->type == type && !(p->ra_flags & ND_RA_FLAG_SNAC) &&
+	       ipv6_addr_kl_candidate(&p->prefix, p->prefix_len) &&
+	       !inet6_adv_prefix_expired(p);
+}
+
+/* Rule 5: whether the address is in prefixes only seen from SNAC routers */
+static bool addrconf_kl_snac_only(const struct inet6_dev *idev,
+				  const struct in6_addr *addr)
+{
+	const struct inet6_adv_prefix *p;
+	bool seen = false;
+
+	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
+		if (p->type != ND_OPT_PREFIX_INFO ||
+		    inet6_adv_prefix_expired(p) ||
+		    !ipv6_prefix_equal(addr, &p->prefix, p->prefix_len))
+			continue;
+		if (!(p->ra_flags & ND_RA_FLAG_SNAC))
+			return false;
+		seen = true;
+	}
+	return seen;
+}
+
+/* The known-local ULA prefixes of an interface, after rules 1 to 5 of
+ * draft-ietf-6man-rfc6724-update section 3.3. The prefixes of RIOs come
+ * first, with their own length, then the /48 of PIOs and of addresses that
+ * they do not cover, whatever the order in which they were learnt.
+ */
+static int addrconf_kl_collect(struct inet6_dev *idev,
+			       struct ip6addrlbl_kl *set)
+{
+	const struct inet6_adv_prefix *p;
+	const struct inet6_ifaddr *ifp;
+	int i, n = 0, rios = 0;
+
+	read_lock_bh(&idev->lock);
+	if (idev->dead)
+		goto out;
+
+	/* Rules 2 and 3: RIOs of /40 or longer, shortest first. There are
+	 * at most INET6_ADV_RIOS_MAX of them.
+	 */
+	BUILD_BUG_ON(INET6_ADV_RIOS_MAX > IP6ADDRLBL_KL_MAX);
+	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
+		if (addrconf_kl_usable(p, ND_OPT_ROUTE_INFO) &&
+		    p->prefix_len >= 40 && rios < IP6ADDRLBL_KL_MAX) {
+			set[rios].prefix = p->prefix;
+			set[rios++].prefixlen = p->prefix_len;
+		}
+	}
+	sort(set, rios, sizeof(*set), addrconf_kl_cmp, NULL);
+	for (i = 0; i < rios; i++) {
+		if (!addrconf_kl_covered(set, n, &set[i].prefix,
+					 set[i].prefixlen))
+			set[n++] = set[i];
+	}
+
+	/* Rule 4: PIOs whatever their flags, as a /48 */
+	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
+		if (addrconf_kl_usable(p, ND_OPT_PREFIX_INFO))
+			addrconf_kl_add(set, &n, &p->prefix, p->prefix_len, 48,
+					idev->dev);
+	}
+
+	/* Rule 5: addresses, as a /48 */
+	list_for_each_entry(ifp, &idev->addr_list, if_list) {
+		if (ipv6_addr_kl_candidate(&ifp->addr, 128) &&
+		    !(READ_ONCE(ifp->flags) &
+		      (IFA_F_TENTATIVE | IFA_F_DADFAILED)) &&
+		    !addrconf_kl_snac_only(idev, &ifp->addr))
+			addrconf_kl_add(set, &n, &ifp->addr, 128, 48,
+					idev->dev);
+	}
+out:
+	read_unlock_bh(&idev->lock);
+	return n;
+}
+
+void addrconf_kl_work(struct work_struct *work)
+{
+	struct net *net = container_of(work, struct net,
+				       ipv6.ip6addrlbl_table.kl_work);
+	struct ip6addrlbl_kl *set;
+	struct net_device *dev;
+
+	set = kmalloc_array(IP6ADDRLBL_KL_MAX, sizeof(*set), GFP_KERNEL);
+	if (!set)
+		return;
+
+	rtnl_net_lock(net);
+	for_each_netdev(net, dev) {
+		struct inet6_dev *idev = __in6_dev_get(dev);
+		int n = 0;
+
+		if (!idev || !test_and_clear_bit(0, &idev->kl_dirty))
+			continue;
+
+		if (addrconf_kl_enabled(idev))
+			n = addrconf_kl_collect(idev, set);
+		ip6addrlbl_kl_sync(net, dev->ifindex, set, n);
+	}
+	rtnl_net_unlock(net);
+	kfree(set);
 }
 
 /*
@@ -4325,6 +4539,9 @@ static int addrconf_ifdown(struct net_device *dev, bool unregister)
 		/* Step 1.5: remove snmp6 entry */
 		snmp6_unregister_dev(idev);
 
+		/* and the known-local ULA entries of the policy table */
+		ip6addrlbl_kl_sync(net, dev->ifindex, NULL, 0);
+
 	}
 
 	/* combine the user config with event to determine if permanent
@@ -6212,6 +6429,7 @@ static void ipv6_store_devconf(const struct ipv6_devconf *cnf,
 	array[DEVCONF_FORCE_FORWARDING] = READ_ONCE(cnf->force_forwarding);
 	array[DEVCONF_USE_NEXTHOP_PREFIXES] =
 		READ_ONCE(cnf->use_nexthop_prefixes);
+	array[DEVCONF_KNOWN_LOCAL_ULA] = READ_ONCE(cnf->known_local_ula);
 }
 
 static inline size_t inet6_ifla6_size(void)
@@ -7152,6 +7370,8 @@ static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
 		rt_genid_bump_ipv6(net);
 		break;
 	}
+	if (event && ipv6_addr_kl_candidate(&ifp->addr, 128))
+		addrconf_kl_mark(ifp->idev, false);
 	atomic_inc(&net->ipv6.dev_addr_genid);
 }
 
@@ -7162,6 +7382,35 @@ static void ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
 }
 
 #ifdef CONFIG_SYSCTL
+
+static int addrconf_sysctl_known_local_ula(const struct ctl_table *ctl,
+					   int write, void *buffer,
+					   size_t *lenp, loff_t *ppos)
+{
+	struct inet6_dev *idev = ctl->extra1;
+	struct net *net = ctl->extra2;
+	struct ctl_table lctl = *ctl;
+	int ret;
+
+	lctl.extra1 = SYSCTL_ZERO;
+	lctl.extra2 = SYSCTL_ONE;
+	ret = proc_dou8vec_minmax(&lctl, write, buffer, lenp, ppos);
+	if (!write || ret)
+		return ret;
+
+	/* "default" only applies to new interfaces, "all" sets it and all the
+	 * interfaces, like forwarding.
+	 */
+	if (idev) {
+		addrconf_kl_mark(idev, true);
+	} else if (ctl->data == &net->ipv6.devconf_all->known_local_ula) {
+		u8 val = READ_ONCE(net->ipv6.devconf_all->known_local_ula);
+
+		WRITE_ONCE(net->ipv6.devconf_dflt->known_local_ula, val);
+		__addrconf_kl_mark_all(net, val);
+	}
+	return 0;
+}
 
 static int addrconf_sysctl_forward(const struct ctl_table *ctl, int write,
 		void *buffer, size_t *lenp, loff_t *ppos)
@@ -7863,6 +8112,13 @@ static const struct ctl_table addrconf_sysctl[] = {
 		.proc_handler	= proc_dou8vec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "known_local_ula",
+		.data		= &ipv6_devconf.known_local_ula,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= addrconf_sysctl_known_local_ula,
 	},
 #ifdef CONFIG_IPV6_ROUTER_PREF
 	{

@@ -246,6 +246,9 @@ struct inet6_dev {
 	struct hlist_head	adv_prefixes;
 	unsigned int		adv_prefixes_count;
 	unsigned int		adv_rios_count;
+
+	/* Bit 0: known-local ULA prefixes to compute again */
+	unsigned long		kl_dirty;
 };
 
 static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)
