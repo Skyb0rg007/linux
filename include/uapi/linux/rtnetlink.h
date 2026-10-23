@@ -638,6 +638,8 @@ struct prefixmsg {
  * for the lifetime of entries refreshed by Router Advertisements.
  * PREFIX_PROTO tells who added an entry: the kernel only updates and
  * removes the entries it added for Router Advertisements, RTPROT_RA.
+ * PREFIX_RA_FLAGS is the flags field of the last Router Advertisement that
+ * advertised the prefix, e.g. with the SNAC Router flag (0x02).
  */
 enum 
 {
@@ -646,6 +648,7 @@ enum
 	PREFIX_CACHEINFO,
 	PREFIX_ROUTER,		/* struct in6_addr, link-local of router */
 	PREFIX_PROTO,		/* u8, RTPROT_* */
+	PREFIX_RA_FLAGS,	/* u8, as NDUSEROPT_RA_FLAGS */
 	__PREFIX_MAX
 };
 
