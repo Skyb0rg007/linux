@@ -1215,6 +1215,109 @@ def ipv6_ndisc_useropt_rio() -> None:
             ksft_eq(attrs.get(NDUSEROPT_SRCADDR), _in6("fe80::1"))
 
 
+RTM_NEWADDRLABEL = 72
+RTM_DELADDRLABEL = 73
+RTM_GETADDRLABEL = 74
+IFAL_ADDRESS = 1
+IFAL_LABEL = 2
+IFAL_PRECEDENCE = 3
+
+
+def _addrlabel_change(msg_type, prefix, plen, label, precedence=None, flags=0,
+                      ifindex=0):
+    header = struct.pack('=BBBBII', socket.AF_INET6, 0, plen, 0, ifindex, 0)
+    attrs = _nlattr(IFAL_ADDRESS, _in6(prefix))
+    attrs += _nlattr(IFAL_LABEL, struct.pack('=I', label))
+    if precedence is not None:
+        attrs += _nlattr(IFAL_PRECEDENCE, struct.pack('=I', precedence))
+    err, _ = _rtnl_request(msg_type, Netlink.NLM_F_ACK | flags, header, attrs)
+    return err
+
+
+def _addrlabel_entry(hdr, attrs):
+    _, _, plen, _, ifindex, _ = struct.unpack('=BBBBII', hdr)
+    entry = {'prefix': f"{_ntop6(attrs[IFAL_ADDRESS])}/{plen}",
+             'label': struct.unpack('=I', attrs[IFAL_LABEL])[0],
+             'ifindex': ifindex}
+    if IFAL_PRECEDENCE in attrs:
+        entry['precedence'] = struct.unpack('=I', attrs[IFAL_PRECEDENCE])[0]
+    return entry
+
+
+def _addrlabel_dump(ifindex=0):
+    """Return the address label entries of ifindex as {prefix: entry}."""
+
+    header = struct.pack('=BBBBII', socket.AF_INET6, 0, 0, 0, 0, 0)
+    err, replies = _rtnl_request(RTM_GETADDRLABEL, Netlink.NLM_F_DUMP, header)
+    ksft_eq(err, 0, "RTM_GETADDRLABEL dump failed")
+    table = {}
+    for hdr, attrs in replies:
+        entry = _addrlabel_entry(hdr, attrs)
+        if entry['ifindex'] == ifindex:
+            table[entry.pop('prefix')] = entry
+    return table
+
+
+def ipv6_addrlabel_precedence() -> None:
+    """
+    IFAL_PRECEDENCE carries the RFC 6724 precedence of an address selection
+    policy entry. Privileged users set it, everybody can read it.
+    """
+
+    with NetNS() as ns:
+        with NetNSEnter(str(ns)):
+            table = _addrlabel_dump()
+            if 'precedence' not in table.get('::/0', {}):
+                raise KsftSkipEx("kernel does not support IFAL_PRECEDENCE")
+
+            # The default table, updated by draft-ietf-6man-rfc6724-update.
+            ksft_eq(table['::1/128']['precedence'], 50)
+            ksft_eq(table['::/0']['precedence'], 40)
+            ksft_eq(table['fc00::/7']['precedence'], 30)
+            ksft_eq(table['::ffff:0.0.0.0/96']['precedence'], 20)
+            ksft_eq(table['2002::/16']['precedence'], 5)
+            ksft_not_in('precedence', table['2001:10::/28'])
+
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 14, 45), 0)
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:2::', 48, 15), 0)
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:3::', 48, 16,
+                                      0xffffffff), -errno.ERANGE)
+
+            table = _addrlabel_dump()
+            ksft_eq(table['fd00:1::/48'], {'label': 14, 'precedence': 45,
+                                           'ifindex': 0})
+            ksft_not_in('precedence', table['fd00:2::/48'])
+            ksft_not_in('fd00:3::/48', table)
+
+            # Replacing an entry without the attribute drops the precedence.
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 14,
+                                      flags=Netlink.NLM_F_REPLACE), 0)
+            ksft_not_in('precedence', _addrlabel_dump()['fd00:1::/48'])
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 14, 45,
+                                      flags=Netlink.NLM_F_REPLACE), 0)
+
+            # Unless the prefix is in the default table, like with
+            # "ip addrlabel del" and "add" to change the label of ::/0.
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, '::', 0, 1), 0)
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, '::', 0, 7), 0)
+            ksft_eq(_addrlabel_dump()['::/0'], {'label': 7, 'precedence': 40,
+                                                'ifindex': 0})
+            # But not for the entry of an interface.
+            lo = socket.if_nametoindex("lo")
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, '::', 0, 8,
+                                      ifindex=lo), 0)
+            ksft_not_in('precedence', _addrlabel_dump(lo)['::/0'])
+
+            table = _as_nobody(_addrlabel_dump)
+            ksft_in('fd00:1::/48', table)
+            ksft_eq(table['fd00:1::/48'].get('precedence'), 45)
+            ksft_eq(_as_nobody(lambda: _addrlabel_change(
+                RTM_NEWADDRLABEL, 'fd00:4::', 48, 14, 45)), -errno.EPERM)
+
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fd00:1::', 48, 14), 0)
+            ksft_not_in('fd00:1::/48', _addrlabel_dump())
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, dump_mcaddr_l2_check,
               ipv4_devconf_notify,
@@ -1230,7 +1333,8 @@ def main() -> None:
               ipv6_saddr_adv_prefix_icmp,
               ipv6_saddr_adv_prefix_rule,
               ipv6_ndisc_useropt_ra_flags,
-              ipv6_ndisc_useropt_rio])
+              ipv6_ndisc_useropt_rio,
+              ipv6_addrlabel_precedence])
     ksft_exit()
 
 if __name__ == "__main__":
