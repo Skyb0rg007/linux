@@ -174,12 +174,17 @@ struct inet6_adv_prefix {
 	unsigned long		expires;	/* jiffies, unless permanent */
 	bool			permanent;
 	u8			prefix_len;
-	u8			flags;		/* PIO flags */
+	u8			type;		/* ND_OPT_PREFIX_INFO or
+						 * ND_OPT_ROUTE_INFO
+						 */
+	u8			flags;		/* flags of the option */
 	u8			ra_flags;	/* flags of the RA, ND_RA_FLAG_* */
 	u8			protocol;	/* RTPROT_* */
 };
 
+/* Separately, so that RIOs do not keep PIOs out */
 #define INET6_ADV_PREFIXES_MAX	64
+#define INET6_ADV_RIOS_MAX	32
 
 struct inet6_dev {
 	struct net_device	*dev;
@@ -240,6 +245,7 @@ struct inet6_dev {
 	/* Prefixes advertised by routers, written under lock, read under RCU */
 	struct hlist_head	adv_prefixes;
 	unsigned int		adv_prefixes_count;
+	unsigned int		adv_rios_count;
 };
 
 static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)

@@ -1530,8 +1530,11 @@ skip_linkparms:
 				continue;
 			if (ri->prefix_len > READ_ONCE(in6_dev->cnf.accept_ra_rt_info_max_plen))
 				continue;
-			rt6_route_rcv(skb->dev, (u8 *)p, (p->nd_opt_len) << 3,
-				      &ipv6_hdr(skb)->saddr);
+			if (!rt6_route_rcv(skb->dev, (u8 *)p,
+					   p->nd_opt_len << 3,
+					   &ipv6_hdr(skb)->saddr))
+				addrconf_rio_rcv(in6_dev, ri,
+						 &ipv6_hdr(skb)->saddr, ra_flags);
 		}
 	}
 
