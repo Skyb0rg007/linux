@@ -236,13 +236,18 @@ static bool icmpv6_xrlim_allow(struct sock *sk, u8 type,
 	return res;
 }
 
+/* Also return the router the error is sent to, if any, with the index of its
+ * device, for RFC 6724 rule 5.5.
+ */
 static bool icmpv6_rt_has_prefsrc(struct sock *sk, u8 type,
-				  struct flowi6 *fl6)
+				  struct flowi6 *fl6, struct in6_addr *nexthop,
+				  int *nh_ifindex)
 {
 	struct net *net = sock_net(sk);
 	struct dst_entry *dst;
 	bool res = false;
 
+	*nh_ifindex = 0;
 	dst = ip6_route_output(net, sk, fl6);
 	if (!dst->error) {
 		struct rt6_info *rt = dst_rt6_info(dst);
@@ -250,6 +255,10 @@ static bool icmpv6_rt_has_prefsrc(struct sock *sk, u8 type,
 
 		rt6_get_prefsrc(rt, &prefsrc);
 		res = !ipv6_addr_any(&prefsrc);
+		if (rt->rt6i_flags & RTF_GATEWAY) {
+			*nexthop = rt->rt6i_gateway;
+			*nh_ifindex = dst_dev(dst)->ifindex;
+		}
 	}
 	dst_release(dst);
 	return res;
@@ -651,6 +660,8 @@ void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info,
 	struct flowi6 fl6;
 	struct icmpv6_msg msg;
 	struct ipcm6_cookie ipc6;
+	struct in6_addr nexthop;
+	int nh_ifindex;
 	int iif = 0;
 	int addr_type = 0;
 	int len;
@@ -747,19 +758,26 @@ void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info,
 	memset(&fl6, 0, sizeof(fl6));
 	fl6.flowi6_proto = IPPROTO_ICMPV6;
 	fl6.daddr = hdr->saddr;
+	/* Hash the offending packet first, so that the route looked up to
+	 * select the source address takes the same path as the error.
+	 */
+	fl6.mp_hash = rt6_multipath_hash(net, &fl6, skb, NULL);
 	if (force_saddr)
 		saddr = force_saddr;
 	if (saddr) {
 		fl6.saddr = *saddr;
-	} else if (!icmpv6_rt_has_prefsrc(sk, type, &fl6)) {
+	} else if (!icmpv6_rt_has_prefsrc(sk, type, &fl6, &nexthop,
+					  &nh_ifindex)) {
 		/* select a more meaningful saddr from input if */
 		struct net_device *in_netdev;
 
 		in_netdev = dev_get_by_index(net, parm->iif);
 		if (in_netdev) {
-			ipv6_dev_get_saddr(net, in_netdev, &fl6.daddr,
-					   inet6_sk(sk)->srcprefs,
-					   &fl6.saddr);
+			ipv6_dev_get_saddr_nh(net, in_netdev, &fl6.daddr,
+					      nh_ifindex == in_netdev->ifindex ?
+					      &nexthop : NULL,
+					      inet6_sk(sk)->srcprefs,
+					      &fl6.saddr);
 			dev_put(in_netdev);
 		}
 	}
@@ -768,7 +786,6 @@ void icmp6_send(struct sk_buff *skb, u8 type, u8 code, __u32 info,
 	fl6.fl6_icmp_type = type;
 	fl6.fl6_icmp_code = code;
 	fl6.flowi6_uid = sock_net_uid(net, NULL);
-	fl6.mp_hash = rt6_multipath_hash(net, &fl6, skb, NULL);
 	security_skb_classify_flow(skb, flowi6_to_flowi_common(&fl6));
 
 	np = inet6_sk(sk);
