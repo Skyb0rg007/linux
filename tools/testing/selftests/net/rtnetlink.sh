@@ -401,6 +401,15 @@ kci_test_addrlabel()
 
 	ip addrlabel del prefix 1c3::/64 label 12345 2>/dev/null
 
+	# A prefix that has a label is found when another prefix of the same
+	# length was added after it.
+	run_cmd ip addrlabel add prefix dead:1::/64 label 100
+	run_cmd ip addrlabel add prefix dead:2::/64 label 101
+	run_cmd_fail ip addrlabel add prefix dead:1::/64 label 102
+	run_cmd ip addrlabel del prefix dead:1::/64 label 100
+	run_cmd_grep_fail "prefix dead:1::/64" ip addrlabel list
+	run_cmd ip addrlabel del prefix dead:2::/64 label 101
+
 	if [ $ret -ne 0 ];then
 		end_test "FAIL: ipv6 addrlabel"
 		return 1
