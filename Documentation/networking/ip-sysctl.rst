@@ -2966,6 +2966,28 @@ use_oif_addrs_only - BOOLEAN
 
 	Default: 0 (disabled)
 
+use_nexthop_prefixes - BOOLEAN
+	When enabled, source address selection prefers addresses of this
+	interface in a prefix advertised by the next-hop router of the
+	destination (RFC 6724 rule 5.5, RFC 8028).
+
+	The kernel records the prefixes of the Prefix Information Options
+	of the Router Advertisements it processes, whatever the flags of the
+	options, along with the router that sent them, until their valid
+	lifetime ends or the interface goes down. At most 64 entries are
+	kept per interface, further prefixes are not recorded.
+
+	A prefix that is longer than the subnet of an address, taken to be
+	a /64 for addresses with a prefix length of at most 64 and for /128
+	addresses, does not count for that address.
+
+	Possible values:
+
+	- 0 (disabled)
+	- 1 (enabled)
+
+	Default: 1 (enabled)
+
 use_tempaddr - INTEGER
 	Preference for Privacy Extensions (RFC3041).
 

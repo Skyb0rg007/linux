@@ -1162,7 +1162,7 @@ static int ip6_dst_lookup_tail(struct net *net, const struct sock *sk,
 
 		rcu_read_lock();
 		from = rt ? rcu_dereference(rt->from) : NULL;
-		err = ip6_route_get_saddr(net, from, &fl6->daddr,
+		err = ip6_route_get_saddr(net, from, &fl6->daddr, rt,
 					  sk ? READ_ONCE(inet6_sk(sk)->srcprefs) : 0,
 					  fl6->flowi6_l3mdev,
 					  &fl6->saddr);

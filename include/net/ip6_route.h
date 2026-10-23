@@ -142,8 +142,21 @@ void rt6_flush_exceptions(struct fib6_info *f6i);
 void rt6_age_exceptions(struct fib6_info *f6i, struct fib6_gc_args *gc_args,
 			unsigned long now);
 
+/* The router that @rt sends to, if it uses one and leaves through @dev, as
+ * the next-hop of RFC 6724 rule 5.5. Routers are identified by their address
+ * on the link, hence a gateway on another device must not be passed.
+ */
+static inline const struct in6_addr *
+rt6_saddr_nexthop(const struct rt6_info *rt, const struct net_device *dev)
+{
+	if (!rt || !(rt->rt6i_flags & RTF_GATEWAY) || dst_dev(&rt->dst) != dev)
+		return NULL;
+	return &rt->rt6i_gateway;
+}
+
 static inline int ip6_route_get_saddr(struct net *net, struct fib6_info *f6i,
 				      const struct in6_addr *daddr,
+				      const struct rt6_info *rt,
 				      unsigned int prefs, int l3mdev_index,
 				      struct in6_addr *saddr)
 {
@@ -161,7 +174,10 @@ static inline int ip6_route_get_saddr(struct net *net, struct fib6_info *f6i,
 	if (f6i && f6i->fib6_prefsrc.plen && same_vrf)
 		*saddr = f6i->fib6_prefsrc.addr;
 	else
-		err = ipv6_dev_get_saddr(net, same_vrf ? dev : l3mdev, daddr, prefs, saddr);
+		err = ipv6_dev_get_saddr_nh(net, same_vrf ? dev : l3mdev, daddr,
+					    same_vrf ? rt6_saddr_nexthop(rt, dev) :
+						       NULL,
+					    prefs, saddr);
 
 	rcu_read_unlock();
 
