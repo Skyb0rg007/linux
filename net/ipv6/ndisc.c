@@ -198,6 +198,7 @@ static inline int ndisc_is_useropt(const struct net_device *dev,
 				   struct nd_opt_hdr *opt)
 {
 	return opt->nd_opt_type == ND_OPT_PREFIX_INFO ||
+		opt->nd_opt_type == ND_OPT_ROUTE_INFO ||
 		opt->nd_opt_type == ND_OPT_RDNSS ||
 		opt->nd_opt_type == ND_OPT_DNSSL ||
 		opt->nd_opt_type == ND_OPT_6CO ||
@@ -1578,7 +1579,8 @@ skip_routeinfo:
 		}
 	}
 
-	if (ndopts.nd_useropts) {
+	if (ndopts.nd_useropts &&
+	    rtnl_has_listeners(dev_net(skb->dev), RTNLGRP_ND_USEROPT)) {
 		struct nd_opt_hdr *p;
 		for (p = ndopts.nd_useropts;
 		     p;
