@@ -1207,7 +1207,8 @@ static void ndisc_ra_useropt(struct sk_buff *ra, struct nd_opt_hdr *opt)
 	int err;
 	int base_size = NLMSG_ALIGN(sizeof(struct nduseroptmsg)
 				    + (opt->nd_opt_len << 3));
-	size_t msg_size = base_size + nla_total_size(sizeof(struct in6_addr));
+	size_t msg_size = base_size + nla_total_size(sizeof(struct in6_addr)) +
+			  nla_total_size(sizeof(u8));
 
 	skb = nlmsg_new(msg_size, GFP_ATOMIC);
 	if (!skb) {
@@ -1232,7 +1233,9 @@ static void ndisc_ra_useropt(struct sk_buff *ra, struct nd_opt_hdr *opt)
 
 	memcpy(ndmsg + 1, opt, opt->nd_opt_len << 3);
 
-	if (nla_put_in6_addr(skb, NDUSEROPT_SRCADDR, &ipv6_hdr(ra)->saddr))
+	if (nla_put_in6_addr(skb, NDUSEROPT_SRCADDR, &ipv6_hdr(ra)->saddr) ||
+	    nla_put_u8(skb, NDUSEROPT_RA_FLAGS,
+		       icmp6h->icmp6_dataun.un_data8[1]))
 		goto nla_put_failure;
 	nlmsg_end(skb, nlh);
 
