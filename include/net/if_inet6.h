@@ -175,6 +175,7 @@ struct inet6_adv_prefix {
 	bool			permanent;
 	u8			prefix_len;
 	u8			flags;		/* PIO flags */
+	u8			protocol;	/* RTPROT_* */
 };
 
 #define INET6_ADV_PREFIXES_MAX	64

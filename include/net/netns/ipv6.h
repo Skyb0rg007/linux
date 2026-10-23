@@ -118,6 +118,7 @@ struct netns_ipv6 {
 #endif
 	atomic_t		dev_addr_genid;
 	atomic_t		adv_prefixes;	/* entries of all devices */
+	atomic_t		adv_prefixes_genid;
 	atomic_t		fib6_sernum;
 	struct seg6_pernet_data *seg6_data;
 	struct fib_notifier_ops	*notifier_ops;
