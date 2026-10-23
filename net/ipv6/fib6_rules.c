@@ -137,8 +137,13 @@ struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi6 *fl6,
 	return &net->ipv6.ip6_null_entry->dst;
 }
 
+/* @nexthop is the router that the route found by the rule sends to, so that
+ * the source address matched against the rule is the one that
+ * ip6_dst_lookup_tail() then selects with RFC 6724 rule 5.5.
+ */
 static int fib6_rule_saddr(struct net *net, struct fib_rule *rule, int flags,
-			   struct flowi6 *flp6, const struct net_device *dev)
+			   struct flowi6 *flp6, const struct net_device *dev,
+			   const struct in6_addr *nexthop)
 {
 	struct fib6_rule *r = (struct fib6_rule *)rule;
 
@@ -149,8 +154,8 @@ static int fib6_rule_saddr(struct net *net, struct fib_rule *rule, int flags,
 	    r->src.plen && !(flags & RT6_LOOKUP_F_HAS_SADDR)) {
 		struct in6_addr saddr;
 
-		if (ipv6_dev_get_saddr(net, dev, &flp6->daddr,
-				       rt6_flags2srcprefs(flags), &saddr))
+		if (ipv6_dev_get_saddr_nh(net, dev, &flp6->daddr, nexthop,
+					  rt6_flags2srcprefs(flags), &saddr))
 			return -EAGAIN;
 
 		if (!ipv6_prefix_equal(&saddr, &r->src.addr, r->src.plen))
@@ -193,7 +198,9 @@ static int fib6_rule_action_alt(struct fib_rule *rule, struct flowi *flp,
 	err = fib6_table_lookup(net, table, *oif, flp6, res, flags);
 	if (!err && res->f6i != net->ipv6.fib6_null_entry)
 		err = fib6_rule_saddr(net, rule, flags, flp6,
-				      res->nh->fib_nh_dev);
+				      res->nh->fib_nh_dev,
+				      res->nh->fib_nh_gw_family == AF_INET6 ?
+				      &res->nh->fib_nh_gw6 : NULL);
 	else
 		err = -EAGAIN;
 
@@ -244,8 +251,8 @@ static int __fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 
 		if (!idev)
 			goto again;
-		err = fib6_rule_saddr(net, rule, flags, flp6,
-				      idev->dev);
+		err = fib6_rule_saddr(net, rule, flags, flp6, idev->dev,
+				      rt6_saddr_nexthop(rt, idev->dev));
 
 		if (err == -EAGAIN)
 			goto again;
