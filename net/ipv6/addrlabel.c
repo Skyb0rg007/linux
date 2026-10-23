@@ -56,7 +56,8 @@ struct ip6addrlbl_entry {
  * Note: Labels for ULA and 6to4 are different from labels listed in RFC6724.
  * Note: The precedences are the ones updated by
  *	 draft-ietf-6man-rfc6724-update. The kernel does not use them itself,
- *	 they are exported for destination address selection in userspace.
+ *	 they are exported for destination address selection in userspace,
+ *	 see IPV6_ADDR_SELECTION.
  * Note: An entry for all interfaces added without a precedence for one of
  *	 these prefixes gets the precedence listed here, so that changing
  *	 only the label of e.g. ::/0 leaves its precedence alone.
@@ -168,6 +169,32 @@ u32 ipv6_addr_label(struct net *net,
 			    ifindex, label);
 
 	return label;
+}
+
+/* Find the precedence of the longest matching prefix that has one, hence
+ * entries that only set a label, e.g. 2001:10::/28, take the precedence of
+ * a shorter prefix. If none has one, return 0 with *found false.
+ */
+u32 ipv6_addr_precedence(struct net *net, const struct in6_addr *addr,
+			 int type, int ifindex, bool *found)
+{
+	struct ip6addrlbl_entry *p;
+	u32 precedence = 0;
+
+	type &= IPV6_ADDR_MAPPED | IPV6_ADDR_COMPATv4 | IPV6_ADDR_LOOPBACK;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(p, &net->ipv6.ip6addrlbl_table.head, list) {
+		if (p->precedence != IPV6_ADDR_PRECEDENCE_NONE &&
+		    __ip6addrlbl_match(p, addr, type, ifindex)) {
+			precedence = p->precedence;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	*found = !!p;
+	return precedence;
 }
 
 /* allocate one entry */
