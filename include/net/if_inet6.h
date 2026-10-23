@@ -162,6 +162,23 @@ struct ipv6_devstat {
 	DEFINE_SNMP_STAT_ATOMIC(struct icmpv6msg_mib_device, icmpv6msgdev);
 };
 
+/* A prefix advertised by a router in a Prefix Information option, i.e. the
+ * router is a reasonable first hop for source addresses in the prefix
+ * (RFC 8028, section 3.1). Entries are not modified once published.
+ */
+struct inet6_adv_prefix {
+	struct hlist_node	node;
+	struct rcu_head		rcu;
+	struct in6_addr		prefix;
+	struct in6_addr		router;
+	unsigned long		expires;	/* jiffies, unless permanent */
+	bool			permanent;
+	u8			prefix_len;
+	u8			flags;		/* PIO flags */
+};
+
+#define INET6_ADV_PREFIXES_MAX	64
+
 struct inet6_dev {
 	struct net_device	*dev;
 	netdevice_tracker	dev_tracker;
@@ -217,6 +234,10 @@ struct inet6_dev {
 	struct rcu_head		rcu;
 
 	unsigned int		ra_mtu;
+
+	/* Prefixes advertised by routers, written under lock, read under RCU */
+	struct hlist_head	adv_prefixes;
+	unsigned int		adv_prefixes_count;
 };
 
 static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)

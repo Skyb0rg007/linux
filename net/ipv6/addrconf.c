@@ -241,6 +241,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.use_nexthop_prefixes	= 1,
 };
 
 static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
@@ -306,6 +307,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.use_nexthop_prefixes	= 1,
 };
 
 /* Check if link is ready: is it up and is a valid qdisc available */
@@ -1511,6 +1513,193 @@ out:
 }
 
 /*
+ *	Prefixes advertised by routers (RFC 8028)
+ */
+static bool inet6_adv_prefix_expired(const struct inet6_adv_prefix *p)
+{
+	return !p->permanent && time_after_eq(jiffies, p->expires);
+}
+
+static struct inet6_adv_prefix *
+inet6_adv_prefix_find(struct inet6_dev *idev, const struct in6_addr *prefix,
+		      u8 prefix_len, const struct in6_addr *router)
+{
+	struct inet6_adv_prefix *p;
+
+	lockdep_assert_held(&idev->lock);
+
+	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
+		if (p->prefix_len == prefix_len &&
+		    ipv6_addr_equal(&p->prefix, prefix) &&
+		    ipv6_addr_equal(&p->router, router))
+			return p;
+	}
+
+	return NULL;
+}
+
+static void inet6_adv_prefix_del(struct inet6_dev *idev,
+				 struct inet6_adv_prefix *p)
+{
+	lockdep_assert_held(&idev->lock);
+
+	hlist_del_rcu(&p->node);
+	idev->adv_prefixes_count--;
+	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
+	kfree_rcu(p, rcu);
+}
+
+static void inet6_adv_prefixes_flush(struct inet6_dev *idev, bool expired_only)
+{
+	struct inet6_adv_prefix *p;
+	struct hlist_node *n;
+
+	lockdep_assert_held(&idev->lock);
+
+	hlist_for_each_entry_safe(p, n, &idev->adv_prefixes, node) {
+		if (!expired_only || inet6_adv_prefix_expired(p))
+			inet6_adv_prefix_del(idev, p);
+	}
+}
+
+/* Add or update the entry for the prefix advertised by the router. Like other
+ * rtnetlink objects, an existing entry is only updated with NLM_F_REPLACE,
+ * and a missing entry is only created with NLM_F_CREATE.
+ */
+static int inet6_adv_prefix_set(struct inet6_dev *idev,
+				const struct in6_addr *prefix, u8 prefix_len,
+				const struct in6_addr *router, u8 flags,
+				u32 valid_lft, u16 nlflags, gfp_t gfp,
+				struct netlink_ext_ack *extack)
+{
+	struct inet6_adv_prefix *p, *new;
+	unsigned long timeout;
+	bool verify = false;
+	int err = 0;
+
+	new = kzalloc_obj(*new, gfp);
+	if (!new)
+		return -ENOMEM;
+
+	ipv6_addr_prefix(&new->prefix, prefix, prefix_len);
+	new->prefix_len = prefix_len;
+	new->router = *router;
+	new->flags = flags;
+	timeout = addrconf_timeout_fixup(valid_lft, HZ);
+	new->permanent = !addrconf_finite_timeout(timeout);
+	if (!new->permanent)
+		new->expires = jiffies + timeout * HZ;
+
+	write_lock_bh(&idev->lock);
+
+	/* addrconf_ifdown() flushed the list for good */
+	if (READ_ONCE(idev->dead)) {
+		err = -ENODEV;
+		goto unlock;
+	}
+
+	inet6_adv_prefixes_flush(idev, true);
+
+	p = inet6_adv_prefix_find(idev, &new->prefix, prefix_len, router);
+
+	/* addrconf_verify_rtnl() expires the entry, unless it is already
+	 * scheduled to run before.
+	 */
+	verify = !new->permanent &&
+		 (!p || p->permanent || time_before(new->expires, p->expires));
+
+	if (p) {
+		if (nlflags & NLM_F_EXCL || !(nlflags & NLM_F_REPLACE)) {
+			NL_SET_ERR_MSG(extack, "Prefix already exists");
+			err = -EEXIST;
+			goto unlock;
+		}
+
+		/* Readers may see the old or the new entry, never a mix. */
+		hlist_replace_rcu(&p->node, &new->node);
+		kfree_rcu(p, rcu);
+	} else {
+		if (!(nlflags & NLM_F_CREATE)) {
+			NL_SET_ERR_MSG(extack, "Prefix not found");
+			err = -ENOENT;
+			goto unlock;
+		}
+
+		if (idev->adv_prefixes_count >= INET6_ADV_PREFIXES_MAX) {
+			NL_SET_ERR_MSG(extack, "Too many advertised prefixes");
+			err = -ENOSPC;
+			goto unlock;
+		}
+
+		hlist_add_head_rcu(&new->node, &idev->adv_prefixes);
+		idev->adv_prefixes_count++;
+		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes);
+	}
+	new = NULL;
+
+unlock:
+	write_unlock_bh(&idev->lock);
+	kfree(new);
+	if (!err && verify)
+		addrconf_verify(dev_net(idev->dev));
+	return err;
+}
+
+static int inet6_adv_prefix_remove(struct inet6_dev *idev,
+				   const struct in6_addr *prefix,
+				   u8 prefix_len, const struct in6_addr *router)
+{
+	struct inet6_adv_prefix *p;
+	struct in6_addr pfx;
+	int err = -ENOENT;
+
+	ipv6_addr_prefix(&pfx, prefix, prefix_len);
+
+	write_lock_bh(&idev->lock);
+	p = inet6_adv_prefix_find(idev, &pfx, prefix_len, router);
+	if (p) {
+		inet6_adv_prefix_del(idev, p);
+		err = 0;
+	}
+	write_unlock_bh(&idev->lock);
+
+	return err;
+}
+
+/* Whether other routers than @router assigned the address or its prefix,
+ * but not @router (RFC 6724 rule 5.5), i.e. advertised a prefix that
+ * contains the subnet of the address. A longer prefix only covers part of
+ * the subnet: it is neither the prefix of the address nor what assigned it,
+ * and it would let a Prefix Information option rank the addresses of a
+ * subnet against each other, e.g. a stable address above a temporary one.
+ * The subnet is taken to be a /64 for addresses with a prefix length of at
+ * most 64, and for /128 addresses, e.g. from DHCPv6, which do not tell their
+ * subnet (RFC 4291).
+ *
+ * Must be called under rcu_read_lock().
+ */
+static bool ipv6_ifa_advertised_by_others(const struct inet6_ifaddr *ifp,
+					  const struct in6_addr *router)
+{
+	u8 max_len = ifp->prefix_len > 64 && ifp->prefix_len < 128 ?
+		     ifp->prefix_len : 64;
+	const struct inet6_adv_prefix *p;
+	bool others = false;
+
+	hlist_for_each_entry_rcu(p, &ifp->idev->adv_prefixes, node) {
+		if (p->prefix_len > max_len ||
+		    !ipv6_prefix_equal(&ifp->addr, &p->prefix, p->prefix_len) ||
+		    inet6_adv_prefix_expired(p))
+			continue;
+		if (ipv6_addr_equal(&p->router, router))
+			return false;
+		others = true;
+	}
+
+	return others;
+}
+
+/*
  *	Choose an appropriate source address (RFC3484)
  */
 enum {
@@ -1522,6 +1711,7 @@ enum {
 	IPV6_SADDR_RULE_HOA,
 #endif
 	IPV6_SADDR_RULE_OIF,
+	IPV6_SADDR_RULE_NEXTHOP,
 	IPV6_SADDR_RULE_LABEL,
 	IPV6_SADDR_RULE_PRIVACY,
 	IPV6_SADDR_RULE_ORCHID,
@@ -1543,6 +1733,7 @@ struct ipv6_saddr_score {
 
 struct ipv6_saddr_dst {
 	const struct in6_addr *addr;
+	const struct in6_addr *nexthop;
 	int ifindex;
 	int scope;
 	int label;
@@ -1674,6 +1865,18 @@ static int ipv6_get_saddr_eval(struct net *net,
 		/* Rule 5: Prefer outgoing interface */
 		ret = (!dst->ifindex ||
 		       dst->ifindex == score->ifa->idev->dev->ifindex);
+		break;
+	case IPV6_SADDR_RULE_NEXTHOP:
+		/* Rule 5.5: Prefer addresses in a prefix advertised by the
+		 * next-hop, over the ones that a different next-hop assigned.
+		 * Addresses that no router assigned, e.g. static ones, tie
+		 * with the former.
+		 */
+		ret = !(dst->nexthop &&
+			dst->ifindex == score->ifa->idev->dev->ifindex &&
+			READ_ONCE(score->ifa->idev->cnf.use_nexthop_prefixes) &&
+			ipv6_ifa_advertised_by_others(score->ifa,
+						      dst->nexthop));
 		break;
 	case IPV6_SADDR_RULE_LABEL:
 		/* Rule 6: Prefer matching label */
@@ -1819,9 +2022,21 @@ static int ipv6_get_saddr_master(struct net *net,
 	return hiscore_idx;
 }
 
-int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
-		       const struct in6_addr *daddr, unsigned int prefs,
-		       struct in6_addr *saddr)
+/**
+ * ipv6_dev_get_saddr_nh - select the source address for a destination
+ * @net: network namespace
+ * @dst_dev: outgoing interface, or %NULL
+ * @daddr: destination address
+ * @nexthop: next-hop router on @dst_dev, or %NULL if unknown or on-link
+ * @prefs: IPV6_PREFER_SRC_* flags
+ * @saddr: the selected source address
+ *
+ * Return: 0 on success, -EADDRNOTAVAIL if no address can be used.
+ */
+int ipv6_dev_get_saddr_nh(struct net *net, const struct net_device *dst_dev,
+			  const struct in6_addr *daddr,
+			  const struct in6_addr *nexthop, unsigned int prefs,
+			  struct in6_addr *saddr)
 {
 	struct ipv6_saddr_score scores[2], *hiscore;
 	struct ipv6_saddr_dst dst;
@@ -1834,6 +2049,7 @@ int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
 
 	dst_type = __ipv6_addr_type(daddr);
 	dst.addr = daddr;
+	dst.nexthop = dst_dev ? nexthop : NULL;
 	dst.ifindex = dst_dev ? dst_dev->ifindex : 0;
 	dst.scope = __ipv6_addr_src_scope(dst_type);
 	dst.label = ipv6_addr_label(net, daddr, dst_type, dst.ifindex);
@@ -1915,6 +2131,13 @@ out:
 
 	rcu_read_unlock();
 	return ret;
+}
+
+int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
+		       const struct in6_addr *daddr, unsigned int prefs,
+		       struct in6_addr *saddr)
+{
+	return ipv6_dev_get_saddr_nh(net, dst_dev, daddr, NULL, prefs, saddr);
 }
 EXPORT_SYMBOL(ipv6_dev_get_saddr);
 
@@ -2795,7 +3018,8 @@ int addrconf_prefix_rcv_add_addr(struct net *net, struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(addrconf_prefix_rcv_add_addr);
 
-void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
+void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao,
+			 const struct in6_addr *router)
 {
 	struct prefix_info *pinfo;
 	struct fib6_table *table;
@@ -2930,7 +3154,7 @@ void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
 				goto ok;
 			} else if (ipv6_generate_eui64(addr.s6_addr + 8, dev) &&
 				   ipv6_inherit_eui64(addr.s6_addr + 8, in6_dev)) {
-				goto put;
+				goto adv_router;
 			} else {
 				dev_addr_generated = true;
 			}
@@ -2938,7 +3162,7 @@ void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
 		}
 		net_dbg_ratelimited("IPv6 addrconf: prefix with wrong length %d\n",
 				    pinfo->prefix_len);
-		goto put;
+		goto adv_router;
 
 ok:
 		err = addrconf_prefix_rcv_add_addr(net, dev, pinfo, in6_dev,
@@ -2947,7 +3171,7 @@ ok:
 						   tokenized, valid_lft,
 						   prefered_lft);
 		if (err)
-			goto put;
+			goto adv_router;
 
 		/* Ignore error case here because previous prefix add addr was
 		 * successful which will be notified.
@@ -2959,6 +3183,21 @@ ok:
 					      dev_addr_generated);
 	}
 	inet6_prefix_notify(RTM_NEWPREFIX, in6_dev, pinfo);
+adv_router:
+	/* RFC 8028 section 3.1: the router is a reasonable first hop for
+	 * source addresses in the prefix, whatever the flags of the option.
+	 */
+	if (router && pinfo->prefix_len && pinfo->prefix_len <= 128) {
+		if (valid_lft)
+			inet6_adv_prefix_set(in6_dev, &pinfo->prefix,
+					     pinfo->prefix_len, router,
+					     pinfo->flags, valid_lft,
+					     NLM_F_CREATE | NLM_F_REPLACE,
+					     GFP_ATOMIC, NULL);
+		else
+			inet6_adv_prefix_remove(in6_dev, &pinfo->prefix,
+						pinfo->prefix_len, router);
+	}
 put:
 	in6_dev_put(in6_dev);
 }
@@ -3971,6 +4210,9 @@ restart:
 		write_lock_bh(&idev->lock);
 	}
 
+	/* Step 3.5: forget the prefixes advertised by routers */
+	inet6_adv_prefixes_flush(idev, false);
+
 	list_for_each_entry(ifa, &idev->addr_list, if_list)
 		list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
 	write_unlock_bh(&idev->lock);
@@ -4641,6 +4883,38 @@ int ipv6_chk_rpl_srh_loop(struct net *net, const struct in6_addr *segs,
  *	Periodic address status verification
  */
 
+/* Remove the prefixes advertised by routers when their lifetime ends, and
+ * find when the next one does.
+ */
+static void addrconf_verify_adv_prefixes(struct net *net, unsigned long *next)
+{
+	struct inet6_adv_prefix *p;
+	struct net_device *dev;
+	struct hlist_node *n;
+
+	/* Most namespaces have none, but may have many devices. */
+	if (!atomic_read(&net->ipv6.adv_prefixes))
+		return;
+
+	for_each_netdev(net, dev) {
+		struct inet6_dev *idev = __in6_dev_get(dev);
+
+		if (!idev)
+			continue;
+
+		write_lock(&idev->lock);
+		hlist_for_each_entry_safe(p, n, &idev->adv_prefixes, node) {
+			if (p->permanent)
+				continue;
+			if (inet6_adv_prefix_expired(p))
+				inet6_adv_prefix_del(idev, p);
+			else if (time_before(p->expires, *next))
+				*next = p->expires;
+		}
+		write_unlock(&idev->lock);
+	}
+}
+
 static void addrconf_verify_rtnl(struct net *net)
 {
 	unsigned long now, next, next_sec, next_sched;
@@ -4744,6 +5018,8 @@ restart:
 			}
 		}
 	}
+
+	addrconf_verify_adv_prefixes(net, &next);
 
 	next_sec = round_jiffies_up(next);
 	next_sched = next;
@@ -5753,6 +6029,8 @@ static void ipv6_store_devconf(const struct ipv6_devconf *cnf,
 		READ_ONCE(cnf->accept_untracked_na);
 	array[DEVCONF_ACCEPT_RA_MIN_LFT] = READ_ONCE(cnf->accept_ra_min_lft);
 	array[DEVCONF_FORCE_FORWARDING] = READ_ONCE(cnf->force_forwarding);
+	array[DEVCONF_USE_NEXTHOP_PREFIXES] =
+		READ_ONCE(cnf->use_nexthop_prefixes);
 }
 
 static inline size_t inet6_ifla6_size(void)
@@ -7047,6 +7325,15 @@ static const struct ctl_table addrconf_sysctl[] = {
 	{
 		.procname	= "ra_honor_pio_pflag",
 		.data		= &ipv6_devconf.ra_honor_pio_pflag,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= proc_dou8vec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "use_nexthop_prefixes",
+		.data		= &ipv6_devconf.use_nexthop_prefixes,
 		.maxlen		= sizeof(u8),
 		.mode		= 0644,
 		.proc_handler	= proc_dou8vec_minmax,
