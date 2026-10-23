@@ -92,6 +92,10 @@ enum {
 
 	RTM_NEWPREFIX	= 52,
 #define RTM_NEWPREFIX	RTM_NEWPREFIX
+	RTM_DELPREFIX,
+#define RTM_DELPREFIX	RTM_DELPREFIX
+	RTM_GETPREFIX,
+#define RTM_GETPREFIX	RTM_GETPREFIX
 
 	RTM_NEWMULTICAST = 56,
 #define RTM_NEWMULTICAST RTM_NEWMULTICAST
@@ -617,11 +621,31 @@ struct prefixmsg {
 	unsigned char	prefix_pad3;
 };
 
+/* RTM_NEWPREFIX notifications to RTNLGRP_IPV6_PREFIX report Prefix
+ * Information options received in Router Advertisements.
+ *
+ * In addition, the kernel keeps per interface the prefixes advertised by each
+ * router (RFC 8028), which source address selection uses to prefer addresses
+ * in a prefix advertised by the next-hop (RFC 6724, rule 5.5). Entries are
+ * keyed by interface, prefix, prefix length and router, and expire after
+ * PREFIX_CACHEINFO's valid_time, infinite if absent. The preferred_time is
+ * ignored, and reported as 0. prefix_type is ND_OPT_PREFIX_INFO, and
+ * prefix_flags the flags of the option, which are only reported.
+ *
+ * Userspace that processes Router Advertisements itself manages these
+ * entries with RTM_NEWPREFIX and RTM_DELPREFIX, and they are dumped with
+ * RTM_GETPREFIX. Changes are notified to RTNLGRP_IPV6_ADV_PREFIX, except
+ * for the lifetime of entries refreshed by Router Advertisements.
+ * PREFIX_PROTO tells who added an entry: the kernel only updates and
+ * removes the entries it added for Router Advertisements, RTPROT_RA.
+ */
 enum 
 {
 	PREFIX_UNSPEC,
 	PREFIX_ADDRESS,
 	PREFIX_CACHEINFO,
+	PREFIX_ROUTER,		/* struct in6_addr, link-local address of the router */
+	PREFIX_PROTO,		/* u8, RTPROT_* */
 	__PREFIX_MAX
 };
 
@@ -815,6 +839,8 @@ enum rtnetlink_groups {
 #define RTNLGRP_IPV6_MCADDR	RTNLGRP_IPV6_MCADDR
 	RTNLGRP_IPV6_ACADDR,
 #define RTNLGRP_IPV6_ACADDR	RTNLGRP_IPV6_ACADDR
+	RTNLGRP_IPV6_ADV_PREFIX,
+#define RTNLGRP_IPV6_ADV_PREFIX	RTNLGRP_IPV6_ADV_PREFIX
 	__RTNLGRP_MAX
 };
 #define RTNLGRP_MAX	(__RTNLGRP_MAX - 1)
