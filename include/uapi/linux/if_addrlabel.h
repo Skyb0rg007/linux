@@ -26,6 +26,7 @@ enum {
 	IFAL_ADDRESS = 1,
 	IFAL_LABEL = 2,
 	IFAL_PRECEDENCE = 3,	/* u32, RFC 6724 precedence */
+	IFAL_PROTOCOL = 4,	/* u8, RTPROT_*, who added the entry */
 	__IFAL_MAX
 };
 
@@ -33,6 +34,10 @@ enum {
  * (ifal_index 0) added without it for a prefix of the default policy table
  * gets the default precedence of that prefix, other entries get none, which
  * is dumped without the attribute.
+ *
+ * Changes of the table are notified to RTNLGRP_IPV6_ADDRLABEL. The entries of
+ * the default table have IFAL_PROTOCOL RTPROT_KERNEL, and RTM_DELADDRLABEL
+ * with IFAL_PROTOCOL only removes an entry of that protocol.
  */
 
 #define IFAL_MAX	(__IFAL_MAX - 1)
