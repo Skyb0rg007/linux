@@ -1187,10 +1187,15 @@ route_lookup:
 			dst = NULL;
 			goto tx_err_link_failure;
 		}
-		if (t->parms.collect_md && ipv6_addr_any(&fl6->saddr) &&
-		    ipv6_dev_get_saddr(net, ip6_dst_idev(dst)->dev,
-				       &fl6->daddr, 0, &fl6->saddr))
-			goto tx_err_link_failure;
+		if (t->parms.collect_md && ipv6_addr_any(&fl6->saddr)) {
+			struct net_device *sdev = ip6_dst_idev(dst)->dev;
+			const struct in6_addr *nh;
+
+			nh = rt6_saddr_nexthop(dst_rt6_info(dst), sdev);
+			if (ipv6_dev_get_saddr_nh(net, sdev, &fl6->daddr, nh,
+						  0, &fl6->saddr))
+				goto tx_err_link_failure;
+		}
 		ndst = dst;
 	}
 
