@@ -1018,15 +1018,21 @@ RTM_GETADDRLABEL = 74
 IFAL_ADDRESS = 1
 IFAL_LABEL = 2
 IFAL_PRECEDENCE = 3
+IFAL_PROTOCOL = 4
+RTNLGRP_IPV6_ADDRLABEL = 41
+RTPROT_KERNEL = 2
+IFADDRLBLMSG_LEN = 12
 
 
 def _addrlabel_change(msg_type, prefix, plen, label, precedence=None, flags=0,
-                      ifindex=0):
+                      ifindex=0, proto=None):
     header = struct.pack('=BBBBII', socket.AF_INET6, 0, plen, 0, ifindex, 0)
     attrs = _nlattr(IFAL_ADDRESS, _in6(prefix))
     attrs += _nlattr(IFAL_LABEL, struct.pack('=I', label))
     if precedence is not None:
         attrs += _nlattr(IFAL_PRECEDENCE, struct.pack('=I', precedence))
+    if proto is not None:
+        attrs += _nlattr(IFAL_PROTOCOL, struct.pack('=B', proto))
     err, _ = _rtnl_request(msg_type, Netlink.NLM_F_ACK | flags, header, attrs)
     return err
 
@@ -1038,6 +1044,8 @@ def _addrlabel_entry(hdr, attrs):
              'ifindex': ifindex}
     if IFAL_PRECEDENCE in attrs:
         entry['precedence'] = struct.unpack('=I', attrs[IFAL_PRECEDENCE])[0]
+    if IFAL_PROTOCOL in attrs:
+        entry['proto'] = attrs[IFAL_PROTOCOL][0]
     return entry
 
 
@@ -1115,6 +1123,53 @@ def ipv6_addrlabel_precedence() -> None:
             ksft_not_in('fd00:1::/48', _addrlabel_dump())
 
 
+def ipv6_addrlabel_notify() -> None:
+    """
+    Changes of the address selection policy table are notified, and
+    IFAL_PROTOCOL tells who added an entry.
+    """
+
+    with NetNS() as ns:
+        with NetNSEnter(str(ns)):
+            if _addrlabel_dump()['::/0'].get('proto') != RTPROT_KERNEL:
+                raise KsftSkipEx("kernel does not support IFAL_PROTOCOL")
+
+            sock = _rtnl_listen(RTNLGRP_IPV6_ADDRLABEL)
+            defer(sock.close)
+
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 14, 45,
+                                      proto=RTPROT_STATIC), 0)
+            ksft_eq(_addrlabel_change(RTM_NEWADDRLABEL, 'fd00:1::', 48, 15, 45,
+                                      flags=Netlink.NLM_F_REPLACE,
+                                      proto=RTPROT_STATIC), 0)
+            # Only remove an entry of the given protocol.
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fd00:1::', 48, 15,
+                                      proto=RTPROT_RA), -errno.ESRCH)
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fd00:1::', 48, 15,
+                                      proto=RTPROT_STATIC), 0)
+            ksft_eq(_addrlabel_change(RTM_DELADDRLABEL, 'fd00:1::', 48, 15),
+                    -errno.ESRCH)
+
+            events = [(t, _addrlabel_entry(h, a))
+                      for t, h, a in _rtnl_events(sock, IFADDRLBLMSG_LEN, 4,
+                                                  deadline=2)]
+            entry = {'prefix': 'fd00:1::/48', 'precedence': 45, 'ifindex': 0,
+                     'proto': RTPROT_STATIC}
+            ksft_eq(events, [(RTM_NEWADDRLABEL, {**entry, 'label': 14}),
+                             (RTM_NEWADDRLABEL, {**entry, 'label': 15}),
+                             (RTM_DELADDRLABEL, {**entry, 'label': 15})])
+
+            # The sequence number of the table changes with every change.
+            seqs = set()
+            for msg_type in (RTM_NEWADDRLABEL, RTM_DELADDRLABEL):
+                ksft_eq(_addrlabel_change(msg_type, 'fd00:2::', 48, 16), 0)
+                header = struct.pack('=BBBBII', socket.AF_INET6, 0, 0, 0, 0, 0)
+                _, replies = _rtnl_request(RTM_GETADDRLABEL,
+                                           Netlink.NLM_F_DUMP, header)
+                seqs.add(struct.unpack('=BBBBII', replies[0][0])[5])
+            ksft_eq(len(seqs), 2)
+
+
 def main() -> None:
     ksft_run([dump_mcaddr_check, dump_mcaddr6_check, ipv4_devconf_notify,
               ipv6_route_del_reason_expired,
@@ -1128,7 +1183,8 @@ def main() -> None:
               ipv6_saddr_adv_prefix_rule,
               ipv6_ndisc_useropt_ra_flags,
               ipv6_ndisc_useropt_rio,
-              ipv6_addrlabel_precedence])
+              ipv6_addrlabel_precedence,
+              ipv6_addrlabel_notify])
     ksft_exit()
 
 if __name__ == "__main__":
