@@ -2168,6 +2168,104 @@ int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
 }
 EXPORT_SYMBOL(ipv6_dev_get_saddr);
 
+static int ipv6_addr_sel_src4(struct net *net, __be32 addr,
+			      struct ipv6_addr_selection *sel)
+{
+	const struct in_ifaddr *ifa;
+	struct in_device *in_dev;
+	struct net_device *dev;
+
+	dev = __ip_dev_find(net, addr, false);
+	in_dev = dev ? __in_dev_get_rcu(dev) : NULL;
+	if (!in_dev)
+		return 0;
+
+	in_dev_for_each_ifa_rcu(ifa, in_dev) {
+		if (ifa->ifa_local != addr)
+			continue;
+		sel->ias_src_prefixlen = 96 + ifa->ifa_prefixlen;
+		if (ifa->ifa_flags & IFA_F_DEPRECATED)
+			sel->ias_flags |= IPV6_ADDR_SEL_SRC_DEPRECATED;
+		return dev->ifindex;
+	}
+	return 0;
+}
+
+static int ipv6_addr_sel_src6(struct net *net, struct net_device *dst_dev,
+			      const struct in6_addr *addr,
+			      struct ipv6_addr_selection *sel)
+{
+	struct inet6_ifaddr *ifa;
+	u32 avoid = IFA_F_DEPRECATED;
+	int ifindex;
+
+	ifa = ipv6_get_ifaddr(net, addr, dst_dev, 0);
+	if (!ifa)
+		return 0;
+
+	/* As in rule 3 of source address selection */
+	if (!ipv6_use_optimistic_addr(net, ifa->idev))
+		avoid |= IFA_F_OPTIMISTIC;
+
+	sel->ias_src_prefixlen = ifa->prefix_len;
+	if (ifa->flags & avoid)
+		sel->ias_flags |= IPV6_ADDR_SEL_SRC_DEPRECATED;
+	if (ifa->flags & IFA_F_HOMEADDRESS)
+		sel->ias_flags |= IPV6_ADDR_SEL_SRC_HOME;
+	ifindex = ifa->idev->dev->ifindex;
+	in6_ifa_put(ifa);
+	return ifindex;
+}
+
+/**
+ * ipv6_addr_sel_info - get what RFC 6724 destination selection needs
+ * @net: network namespace
+ * @dst_dev: outgoing interface, or %NULL if unknown
+ * @saddr: source address, possibly IPv4-mapped
+ * @daddr: destination address, possibly IPv4-mapped
+ * @sel: filled with the labels and precedence of the policy table, and the
+ *	 properties of @saddr
+ *
+ * The labels are looked up like in source address selection, for @daddr
+ * with the outgoing interface and for @saddr with the interface it is
+ * assigned to.
+ *
+ * Context: RCU read-side critical section, which protects @dst_dev.
+ */
+void ipv6_addr_sel_info(struct net *net, struct net_device *dst_dev,
+			const struct in6_addr *saddr,
+			const struct in6_addr *daddr,
+			struct ipv6_addr_selection *sel)
+{
+	int dst_type = __ipv6_addr_type(daddr);
+	int src_type = __ipv6_addr_type(saddr);
+	int dst_ifindex = dst_dev ? dst_dev->ifindex : 0;
+	int src_ifindex;
+	bool found;
+
+	memset(sel, 0, sizeof(*sel));
+	sel->ias_src_prefixlen = 128;
+	if (dst_dev) {
+		/* For rule 7 (prefer native transport) */
+		sel->ias_oif = dst_ifindex;
+		sel->ias_oif_type = dst_dev->type;
+	}
+
+	if (src_type & IPV6_ADDR_MAPPED)
+		src_ifindex = ipv6_addr_sel_src4(net, saddr->s6_addr32[3], sel);
+	else
+		src_ifindex = ipv6_addr_sel_src6(net, dst_dev, saddr, sel);
+	if (!src_ifindex)
+		src_ifindex = dst_ifindex;
+
+	sel->ias_src_label = ipv6_addr_label(net, saddr, src_type, src_ifindex);
+	sel->ias_dst_label = ipv6_addr_label(net, daddr, dst_type, dst_ifindex);
+	sel->ias_dst_precedence = ipv6_addr_precedence(net, daddr, dst_type,
+						       dst_ifindex, &found);
+	if (!found)
+		sel->ias_flags |= IPV6_ADDR_SEL_DST_NO_PRECEDENCE;
+}
+
 static int __ipv6_get_lladdr(struct inet6_dev *idev, struct in6_addr *addr,
 			      u32 banned_flags)
 {

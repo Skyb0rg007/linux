@@ -1075,6 +1075,75 @@ static int compat_ipv6_get_msfilter(struct sock *sk, sockptr_t optval,
 	return 0;
 }
 
+/* A socket may have lost its route, e.g. TCP after a change of the routes */
+static struct dst_entry *ipv6_addr_sel_route(struct sock *sk,
+					     const struct in6_addr *saddr,
+					     const struct in6_addr *daddr)
+{
+	struct flowi6 fl6 = {
+		.flowi6_oif = READ_ONCE(sk->sk_bound_dev_if),
+		.flowi6_mark = READ_ONCE(sk->sk_mark),
+		.flowi6_uid = sk_uid(sk),
+		.flowi6_proto = sk->sk_protocol,
+		.daddr = *daddr,
+		.saddr = *saddr,
+	};
+	struct dst_entry *dst;
+
+	if (ipv6_addr_v4mapped(daddr))
+		return NULL;
+
+	dst = ip6_route_output(sock_net(sk), sk, &fl6);
+	if (dst->error) {
+		dst_release(dst);
+		return NULL;
+	}
+	return dst;
+}
+
+static int ipv6_getsockopt_addr_sel(struct sock *sk, sockptr_t optval,
+				    sockptr_t optlen, int len)
+{
+	struct ipv6_addr_selection sel;
+	struct in6_addr saddr, daddr;
+	struct net_device *dev;
+	struct dst_entry *dst;
+
+	if (len < 0)
+		return -EINVAL;
+
+	sockopt_lock_sock(sk);
+	saddr = sk->sk_v6_rcv_saddr;
+	daddr = sk->sk_v6_daddr;
+	/* Not __sk_dst_check(): UDP sets the route without the socket lock */
+	dst = sk_dst_check(sk, inet6_sk(sk)->dst_cookie);
+	sockopt_release_sock(sk);
+	if (ipv6_addr_any(&daddr) || ipv6_addr_any(&saddr)) {
+		dst_release(dst);
+		return -ENOTCONN;
+	}
+
+	if (!dst)
+		dst = ipv6_addr_sel_route(sk, &saddr, &daddr);
+
+	rcu_read_lock();
+	if (dst)
+		dev = dst_dev_rcu(dst);
+	else
+		dev = dev_get_by_index_rcu(sock_net(sk),
+					   READ_ONCE(sk->sk_bound_dev_if));
+	ipv6_addr_sel_info(sock_net(sk), dev, &saddr, &daddr, &sel);
+	rcu_read_unlock();
+	dst_release(dst);
+
+	len = min_t(unsigned int, sizeof(sel), len);
+	if (copy_to_sockptr(optlen, &len, sizeof(int)))
+		return -EFAULT;
+	if (copy_to_sockptr(optval, &sel, len))
+		return -EFAULT;
+	return 0;
+}
+
 int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 		       sockptr_t optval, sockptr_t optlen)
 {
@@ -1401,6 +1470,10 @@ int do_ipv6_getsockopt(struct sock *sk, int level, int optname,
 			val |= IPV6_PREFER_SRC_HOME;
 		break;
 		}
+
+	case IPV6_ADDR_SELECTION:
+		return ipv6_getsockopt_addr_sel(sk, optval, optlen, len);
+
 	case IPV6_MINHOPCOUNT:
 		val = READ_ONCE(np->min_hopcount);
 		break;

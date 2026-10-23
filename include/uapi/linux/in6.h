@@ -291,6 +291,36 @@ struct in6_flowlabel_req {
 #define IPV6_RECVFRAGSIZE	77
 #define IPV6_FREEBIND		78
 
+/* RFC 6724: Destination address selection, read only, on a connected socket.
+ * D is the peer address and Source(D) the local address of the socket, both
+ * IPv4-mapped for an IPv4 peer. The labels and precedence come from the
+ * policy table (RTM_GETADDRLABEL), for D with the outgoing interface and for
+ * Source(D) with the interface it is assigned to.
+ */
+#define IPV6_ADDR_SELECTION	79
+
+struct ipv6_addr_selection {
+	__u32	ias_flags;		/* IPV6_ADDR_SEL_* */
+	__u32	ias_src_label;		/* Label(Source(D)) */
+	__u32	ias_dst_label;		/* Label(D) */
+	__u32	ias_dst_precedence;	/* Precedence(D) */
+	__u8	ias_src_prefixlen;	/* prefix length of Source(D) */
+	__u8	__ias_reserved;
+	__u16	ias_oif_type;		/* ARPHRD_* of ias_oif */
+	__u32	ias_oif;		/* outgoing interface, 0 if unknown */
+};
+
+/* ias_src_prefixlen is 96 plus the prefix length for an IPv4 address, and 128
+ * if Source(D) is not a local address. IPV6_ADDR_SEL_SRC_DEPRECATED is also
+ * set for an optimistic address that source address selection avoids.
+ * ias_oif is the device of the route of the socket to D, or the device it is
+ * bound to, and ias_oif_type is only valid if ias_oif is not 0. The structure
+ * may grow, a shorter buffer gets the start of it.
+ */
+#define IPV6_ADDR_SEL_SRC_DEPRECATED	0x0001	/* rule 3 */
+#define IPV6_ADDR_SEL_SRC_HOME		0x0002	/* rule 4 */
+#define IPV6_ADDR_SEL_DST_NO_PRECEDENCE	0x0004	/* ias_dst_precedence is 0 */
+
 /*
  * Multicast Routing:
  * see include/uapi/linux/mroute6.h.
