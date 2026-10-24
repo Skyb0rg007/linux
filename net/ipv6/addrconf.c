@@ -1710,6 +1710,7 @@ struct ipv6_saddr_score {
 
 struct ipv6_saddr_dst {
 	const struct in6_addr *addr;
+	const struct in6_addr *nexthop;
 	int ifindex;
 	int scope;
 	int label;
@@ -1986,9 +1987,21 @@ static int ipv6_get_saddr_master(struct net *net,
 	return hiscore_idx;
 }
 
-int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
-		       const struct in6_addr *daddr, unsigned int prefs,
-		       struct in6_addr *saddr)
+/**
+ * ipv6_dev_get_saddr_nh - select the source address for a destination
+ * @net: network namespace
+ * @dst_dev: outgoing interface, or %NULL
+ * @daddr: destination address
+ * @nexthop: next-hop router on @dst_dev, or %NULL if unknown or on-link
+ * @prefs: IPV6_PREFER_SRC_* flags
+ * @saddr: the selected source address
+ *
+ * Return: 0 on success, -EADDRNOTAVAIL if no address can be used.
+ */
+int ipv6_dev_get_saddr_nh(struct net *net, const struct net_device *dst_dev,
+			  const struct in6_addr *daddr,
+			  const struct in6_addr *nexthop, unsigned int prefs,
+			  struct in6_addr *saddr)
 {
 	struct ipv6_saddr_score scores[2], *hiscore;
 	struct ipv6_saddr_dst dst;
@@ -2001,6 +2014,7 @@ int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
 
 	dst_type = __ipv6_addr_type(daddr);
 	dst.addr = daddr;
+	dst.nexthop = dst_dev ? nexthop : NULL;
 	dst.ifindex = dst_dev ? dst_dev->ifindex : 0;
 	dst.scope = __ipv6_addr_src_scope(dst_type);
 	dst.label = ipv6_addr_label(net, daddr, dst_type, dst.ifindex);
@@ -2082,6 +2096,13 @@ out:
 
 	rcu_read_unlock();
 	return ret;
+}
+
+int ipv6_dev_get_saddr(struct net *net, const struct net_device *dst_dev,
+		       const struct in6_addr *daddr, unsigned int prefs,
+		       struct in6_addr *saddr)
+{
+	return ipv6_dev_get_saddr_nh(net, dst_dev, daddr, NULL, prefs, saddr);
 }
 EXPORT_SYMBOL(ipv6_dev_get_saddr);
 
