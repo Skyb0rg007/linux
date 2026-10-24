@@ -30,6 +30,7 @@ struct ip6addrlbl_entry {
 	int addrtype;
 	u32 label;
 	u32 precedence;
+	u8 protocol;
 	struct hlist_node list;
 	struct rcu_head rcu;
 };
@@ -172,7 +173,8 @@ u32 ipv6_addr_label(struct net *net,
 /* allocate one entry */
 static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 						 int prefixlen, int ifindex,
-						 u32 label, u32 precedence)
+						 u32 label, u32 precedence,
+						 u8 protocol)
 {
 	struct ip6addrlbl_entry *newp;
 	int addrtype;
@@ -209,6 +211,7 @@ static struct ip6addrlbl_entry *ip6addrlbl_alloc(const struct in6_addr *prefix,
 	newp->addrtype = addrtype;
 	newp->label = label;
 	newp->precedence = precedence;
+	newp->protocol = protocol;
 	INIT_HLIST_NODE(&newp->list);
 	return newp;
 }
@@ -262,7 +265,8 @@ out:
 /* add a label */
 static int ip6addrlbl_add(struct net *net,
 			  const struct in6_addr *prefix, int prefixlen,
-			  int ifindex, u32 label, u32 precedence, int replace)
+			  int ifindex, u32 label, u32 precedence, u8 protocol,
+			  int replace)
 {
 	struct ip6addrlbl_entry *newp;
 	int ret = 0;
@@ -270,7 +274,8 @@ static int ip6addrlbl_add(struct net *net,
 	net_dbg_ratelimited("%s(prefix=%pI6, prefixlen=%d, ifindex=%d, label=%u, replace=%d)\n",
 			    __func__, prefix, prefixlen, ifindex, (unsigned int)label, replace);
 
-	newp = ip6addrlbl_alloc(prefix, prefixlen, ifindex, label, precedence);
+	newp = ip6addrlbl_alloc(prefix, prefixlen, ifindex, label, precedence,
+				protocol);
 	if (IS_ERR(newp))
 		return PTR_ERR(newp);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
@@ -284,7 +289,7 @@ static int ip6addrlbl_add(struct net *net,
 /* remove a label */
 static int __ip6addrlbl_del(struct net *net,
 			    const struct in6_addr *prefix, int prefixlen,
-			    int ifindex)
+			    int ifindex, u8 protocol)
 {
 	struct ip6addrlbl_entry *p = NULL;
 	struct hlist_node *n;
@@ -297,6 +302,8 @@ static int __ip6addrlbl_del(struct net *net,
 		if (p->prefixlen == prefixlen &&
 		    p->ifindex == ifindex &&
 		    ipv6_addr_equal(&p->prefix, prefix)) {
+			if (protocol && p->protocol != protocol)
+				break;
 			hlist_del_rcu(&p->list);
 			WRITE_ONCE(net->ipv6.ip6addrlbl_table.seq,
 				   net->ipv6.ip6addrlbl_table.seq + 1);
@@ -308,9 +315,10 @@ static int __ip6addrlbl_del(struct net *net,
 	return ret;
 }
 
+/* Only remove an entry of @protocol, if not 0 */
 static int ip6addrlbl_del(struct net *net,
 			  const struct in6_addr *prefix, int prefixlen,
-			  int ifindex)
+			  int ifindex, u8 protocol)
 {
 	struct in6_addr prefix_buf;
 	int ret;
@@ -320,7 +328,8 @@ static int ip6addrlbl_del(struct net *net,
 
 	ipv6_addr_prefix(&prefix_buf, prefix, prefixlen);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
-	ret = __ip6addrlbl_del(net, &prefix_buf, prefixlen, ifindex);
+	ret = __ip6addrlbl_del(net, &prefix_buf, prefixlen, ifindex,
+			       protocol);
 	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
 	return ret;
 }
@@ -342,7 +351,8 @@ static int __net_init ip6addrlbl_net_init(struct net *net)
 				     ip6addrlbl_init_table[i].prefixlen,
 				     0,
 				     ip6addrlbl_init_table[i].label,
-				     ip6addrlbl_init_table[i].precedence, 0);
+				     ip6addrlbl_init_table[i].precedence,
+				     RTPROT_KERNEL, 0);
 		if (err)
 			goto err_ip6addrlbl_add;
 	}
@@ -395,6 +405,7 @@ static const struct nla_policy ifal_policy[IFAL_MAX+1] = {
 	[IFAL_LABEL]		= { .len = sizeof(u32), },
 	[IFAL_PRECEDENCE]	= NLA_POLICY_FULL_RANGE(NLA_U32,
 							&ifal_precedence_range),
+	[IFAL_PROTOCOL]		= { .type = NLA_U8 },
 };
 
 /* The precedence of a new entry without IFAL_PRECEDENCE: that of the same
@@ -439,6 +450,7 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 	struct nlattr *tb[IFAL_MAX+1];
 	u32 precedence = IPV6_ADDR_PRECEDENCE_NONE;
 	struct in6_addr *pfx;
+	u8 protocol;
 	u32 label;
 	int err = 0;
 
@@ -463,6 +475,8 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (label == IPV6_ADDR_LABEL_DEFAULT)
 		return -EINVAL;
 
+	protocol = nla_get_u8_default(tb[IFAL_PROTOCOL], RTPROT_UNSPEC);
+
 	switch (nlh->nlmsg_type) {
 	case RTM_NEWADDRLABEL:
 		if (ifal->ifal_index &&
@@ -476,11 +490,12 @@ static int ip6addrlbl_newdel(struct sk_buff *skb, struct nlmsghdr *nlh,
 
 		err = ip6addrlbl_add(net, pfx, ifal->ifal_prefixlen,
 				     ifal->ifal_index, label, precedence,
+				     protocol,
 				     nlh->nlmsg_flags & NLM_F_REPLACE);
 		break;
 	case RTM_DELADDRLABEL:
 		err = ip6addrlbl_del(net, pfx, ifal->ifal_prefixlen,
-				     ifal->ifal_index);
+				     ifal->ifal_index, protocol);
 		break;
 	default:
 		err = -EOPNOTSUPP;
@@ -516,7 +531,8 @@ static int ip6addrlbl_fill(struct sk_buff *skb,
 	if (nla_put_in6_addr(skb, IFAL_ADDRESS, &p->prefix) < 0 ||
 	    nla_put_u32(skb, IFAL_LABEL, p->label) < 0 ||
 	    (p->precedence != IPV6_ADDR_PRECEDENCE_NONE &&
-	     nla_put_u32(skb, IFAL_PRECEDENCE, p->precedence) < 0)) {
+	     nla_put_u32(skb, IFAL_PRECEDENCE, p->precedence) < 0) ||
+	    (p->protocol && nla_put_u8(skb, IFAL_PROTOCOL, p->protocol) < 0)) {
 		nlmsg_cancel(skb, nlh);
 		return -EMSGSIZE;
 	}
@@ -592,7 +608,8 @@ static inline int ip6addrlbl_msgsize(void)
 	return NLMSG_ALIGN(sizeof(struct ifaddrlblmsg))
 		+ nla_total_size(16)	/* IFAL_ADDRESS */
 		+ nla_total_size(4)	/* IFAL_LABEL */
-		+ nla_total_size(4);	/* IFAL_PRECEDENCE */
+		+ nla_total_size(4)	/* IFAL_PRECEDENCE */
+		+ nla_total_size(1);	/* IFAL_PROTOCOL */
 }
 
 static int ip6addrlbl_valid_get_req(struct sk_buff *skb,
