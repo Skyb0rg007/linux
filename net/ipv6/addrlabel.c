@@ -394,7 +394,8 @@ static void __ip6addrlbl_unlink(struct net *net, struct ip6addrlbl_entry *p,
 static int __ip6addrlbl_del(struct net *net,
 			    const struct in6_addr *prefix, int prefixlen,
 			    int ifindex, u8 protocol, struct sk_buff *skb,
-			    const struct nlmsghdr *nlh, u32 portid)
+			    const struct nlmsghdr *nlh, u32 portid,
+			    bool *ula_policy)
 {
 	struct ip6addrlbl_entry *p = NULL;
 	struct hlist_node *n;
@@ -409,6 +410,7 @@ static int __ip6addrlbl_del(struct net *net,
 		    ipv6_addr_equal(&p->prefix, prefix)) {
 			if (protocol && p->protocol != protocol)
 				break;
+			*ula_policy = ip6addrlbl_is_ula_policy(p);
 			__ip6addrlbl_unlink(net, p, skb, nlh, portid);
 			ret = 0;
 			break;
@@ -423,6 +425,7 @@ static int ip6addrlbl_del(struct net *net,
 			  int ifindex, u8 protocol, const struct nlmsghdr *nlh,
 			  u32 portid)
 {
+	bool ula_policy = false;
 	struct in6_addr prefix_buf;
 	struct sk_buff *skb;
 	int ret;
@@ -434,10 +437,13 @@ static int ip6addrlbl_del(struct net *net,
 	skb = ip6addrlbl_notify_alloc(net, nlh, GFP_KERNEL);
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);
 	ret = __ip6addrlbl_del(net, &prefix_buf, prefixlen, ifindex, protocol,
-			       skb, nlh, portid);
+			       skb, nlh, portid, &ula_policy);
 	spin_unlock(&net->ipv6.ip6addrlbl_table.lock);
 	if (ret)
 		kfree_skb(skb);
+	/* Bring back the known-local entries that it kept out */
+	if (ula_policy)
+		addrconf_kl_mark_all(net);
 	return ret;
 }
 
@@ -451,6 +457,7 @@ static int __net_init ip6addrlbl_net_init(struct net *net)
 
 	spin_lock_init(&net->ipv6.ip6addrlbl_table.lock);
 	INIT_HLIST_HEAD(&net->ipv6.ip6addrlbl_table.head);
+	INIT_WORK(&net->ipv6.ip6addrlbl_table.kl_work, addrconf_kl_work);
 
 	for (i = 0; i < ARRAY_SIZE(ip6addrlbl_init_table); i++) {
 		err = ip6addrlbl_add(net,
@@ -477,6 +484,8 @@ static void __net_exit ip6addrlbl_net_exit(struct net *net)
 {
 	struct ip6addrlbl_entry *p = NULL;
 	struct hlist_node *n;
+
+	cancel_work_sync(&net->ipv6.ip6addrlbl_table.kl_work);
 
 	/* Remove all labels belonging to the exiting net */
 	spin_lock(&net->ipv6.ip6addrlbl_table.lock);

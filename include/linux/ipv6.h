@@ -92,6 +92,7 @@ struct ipv6_devconf {
 	__u8		ra_honor_pio_life;
 	__u8		ra_honor_pio_pflag;
 	__u8		use_nexthop_prefixes;
+	__u8		known_local_ula;
 
 	struct ctl_table_header *sysctl_header;
 };

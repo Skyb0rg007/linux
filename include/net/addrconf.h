@@ -257,6 +257,8 @@ struct ip6addrlbl_kl {
 
 void ip6addrlbl_kl_sync(struct net *net, int ifindex,
 			const struct ip6addrlbl_kl *set, int n);
+void addrconf_kl_work(struct work_struct *work);
+void addrconf_kl_mark_all(struct net *net);
 u32 ipv6_addr_label(struct net *net, const struct in6_addr *addr,
 		    int type, int ifindex);
 u32 ipv6_addr_precedence(struct net *net, const struct in6_addr *addr,
