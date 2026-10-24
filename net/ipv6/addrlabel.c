@@ -298,6 +298,8 @@ static int __ip6addrlbl_del(struct net *net,
 		    p->ifindex == ifindex &&
 		    ipv6_addr_equal(&p->prefix, prefix)) {
 			hlist_del_rcu(&p->list);
+			WRITE_ONCE(net->ipv6.ip6addrlbl_table.seq,
+				   net->ipv6.ip6addrlbl_table.seq + 1);
 			kfree_rcu(p, rcu);
 			ret = 0;
 			break;
@@ -565,6 +567,7 @@ static int ip6addrlbl_dump(struct sk_buff *skb, struct netlink_callback *cb)
 
 	rcu_read_lock();
 	lseq = READ_ONCE(net->ipv6.ip6addrlbl_table.seq);
+	cb->seq = lseq ?: 1;
 	hlist_for_each_entry_rcu(p, &net->ipv6.ip6addrlbl_table.head, list) {
 		if (idx >= s_idx) {
 			err = ip6addrlbl_fill(skb, p,
@@ -575,6 +578,7 @@ static int ip6addrlbl_dump(struct sk_buff *skb, struct netlink_callback *cb)
 					      NLM_F_MULTI);
 			if (err < 0)
 				break;
+			nl_dump_check_consistent(cb, nlmsg_hdr(skb));
 		}
 		idx++;
 	}
