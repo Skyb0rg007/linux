@@ -1524,6 +1524,160 @@ out:
 }
 
 /*
+ *	Prefixes advertised by routers (RFC 8028)
+ */
+static bool inet6_adv_prefix_expired(const struct inet6_adv_prefix *p)
+{
+	return !p->permanent && time_after_eq(jiffies, p->expires);
+}
+
+static struct inet6_adv_prefix *
+inet6_adv_prefix_find(struct inet6_dev *idev, const struct in6_addr *prefix,
+		      u8 prefix_len, const struct in6_addr *router)
+{
+	struct inet6_adv_prefix *p;
+
+	lockdep_assert_held(&idev->lock);
+
+	hlist_for_each_entry(p, &idev->adv_prefixes, node) {
+		if (p->prefix_len == prefix_len &&
+		    ipv6_addr_equal(&p->prefix, prefix) &&
+		    ipv6_addr_equal(&p->router, router))
+			return p;
+	}
+
+	return NULL;
+}
+
+static void inet6_adv_prefix_del(struct inet6_dev *idev,
+				 struct inet6_adv_prefix *p)
+{
+	lockdep_assert_held(&idev->lock);
+
+	hlist_del_rcu(&p->node);
+	idev->adv_prefixes_count--;
+	atomic_dec(&dev_net(idev->dev)->ipv6.adv_prefixes);
+	kfree_rcu(p, rcu);
+}
+
+static void inet6_adv_prefixes_flush(struct inet6_dev *idev, bool expired_only)
+{
+	struct inet6_adv_prefix *p;
+	struct hlist_node *n;
+
+	lockdep_assert_held(&idev->lock);
+
+	hlist_for_each_entry_safe(p, n, &idev->adv_prefixes, node) {
+		if (!expired_only || inet6_adv_prefix_expired(p))
+			inet6_adv_prefix_del(idev, p);
+	}
+}
+
+/* Add or update the entry for the prefix advertised by the router. Like other
+ * rtnetlink objects, an existing entry is only updated with NLM_F_REPLACE,
+ * and a missing entry is only created with NLM_F_CREATE.
+ */
+static int inet6_adv_prefix_set(struct inet6_dev *idev,
+				const struct in6_addr *prefix, u8 prefix_len,
+				const struct in6_addr *router, u8 flags,
+				u32 valid_lft, u16 nlflags, gfp_t gfp,
+				struct netlink_ext_ack *extack)
+{
+	struct inet6_adv_prefix *p, *new;
+	unsigned long timeout;
+	bool verify = false;
+	int err = 0;
+
+	new = kzalloc_obj(*new, gfp);
+	if (!new)
+		return -ENOMEM;
+
+	ipv6_addr_prefix(&new->prefix, prefix, prefix_len);
+	new->prefix_len = prefix_len;
+	new->router = *router;
+	new->flags = flags;
+	timeout = addrconf_timeout_fixup(valid_lft, HZ);
+	new->permanent = !addrconf_finite_timeout(timeout);
+	if (!new->permanent)
+		new->expires = jiffies + timeout * HZ;
+
+	write_lock_bh(&idev->lock);
+
+	/* addrconf_ifdown() flushed the list for good */
+	if (READ_ONCE(idev->dead)) {
+		err = -ENODEV;
+		goto unlock;
+	}
+
+	inet6_adv_prefixes_flush(idev, true);
+
+	p = inet6_adv_prefix_find(idev, &new->prefix, prefix_len, router);
+
+	/* addrconf_verify_rtnl() expires the entry, unless it is already
+	 * scheduled to run before.
+	 */
+	verify = !new->permanent &&
+		 (!p || p->permanent || time_before(new->expires, p->expires));
+
+	if (p) {
+		if (nlflags & NLM_F_EXCL || !(nlflags & NLM_F_REPLACE)) {
+			NL_SET_ERR_MSG(extack, "Prefix already exists");
+			err = -EEXIST;
+			goto unlock;
+		}
+
+		/* Readers may see the old or the new entry, never a mix. */
+		hlist_replace_rcu(&p->node, &new->node);
+		kfree_rcu(p, rcu);
+	} else {
+		if (!(nlflags & NLM_F_CREATE)) {
+			NL_SET_ERR_MSG(extack, "Prefix not found");
+			err = -ENOENT;
+			goto unlock;
+		}
+
+		if (idev->adv_prefixes_count >= INET6_ADV_PREFIXES_MAX) {
+			NL_SET_ERR_MSG(extack, "Too many advertised prefixes");
+			err = -ENOSPC;
+			goto unlock;
+		}
+
+		hlist_add_head_rcu(&new->node, &idev->adv_prefixes);
+		idev->adv_prefixes_count++;
+		atomic_inc(&dev_net(idev->dev)->ipv6.adv_prefixes);
+	}
+	new = NULL;
+
+unlock:
+	write_unlock_bh(&idev->lock);
+	kfree(new);
+	if (!err && verify)
+		addrconf_verify(dev_net(idev->dev));
+	return err;
+}
+
+static int inet6_adv_prefix_remove(struct inet6_dev *idev,
+				   const struct in6_addr *prefix,
+				   u8 prefix_len, const struct in6_addr *router)
+{
+	struct inet6_adv_prefix *p;
+	struct in6_addr pfx;
+	int err = -ENOENT;
+
+	ipv6_addr_prefix(&pfx, prefix, prefix_len);
+
+	write_lock_bh(&idev->lock);
+	p = inet6_adv_prefix_find(idev, &pfx, prefix_len, router);
+	if (p) {
+		inet6_adv_prefix_del(idev, p);
+		err = 0;
+	}
+	write_unlock_bh(&idev->lock);
+
+	return err;
+}
+
+/*
  *	Choose an appropriate source address (RFC3484)
  */
 enum {
@@ -2812,7 +2966,8 @@ int addrconf_prefix_rcv_add_addr(struct net *net, struct net_device *dev,
 }
 EXPORT_SYMBOL_GPL(addrconf_prefix_rcv_add_addr);
 
-void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
+void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao,
+			 const struct in6_addr *router)
 {
 	struct prefix_info *pinfo;
 	struct fib6_table *table;
@@ -2947,7 +3102,7 @@ void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
 				goto ok;
 			} else if (ipv6_generate_eui64(addr.s6_addr + 8, dev) &&
 				   ipv6_inherit_eui64(addr.s6_addr + 8, in6_dev)) {
-				goto put;
+				goto adv_router;
 			} else {
 				dev_addr_generated = true;
 			}
@@ -2955,7 +3110,7 @@ void addrconf_prefix_rcv(struct net_device *dev, u8 *opt, int len, bool sllao)
 		}
 		net_dbg_ratelimited("IPv6 addrconf: prefix with wrong length %d\n",
 				    pinfo->prefix_len);
-		goto put;
+		goto adv_router;
 
 ok:
 		err = addrconf_prefix_rcv_add_addr(net, dev, pinfo, in6_dev,
@@ -2964,7 +3119,7 @@ ok:
 						   tokenized, valid_lft,
 						   prefered_lft);
 		if (err)
-			goto put;
+			goto adv_router;
 
 		/* Ignore error case here because previous prefix add addr was
 		 * successful which will be notified.
@@ -2976,6 +3131,21 @@ ok:
 					      dev_addr_generated);
 	}
 	inet6_prefix_notify(RTM_NEWPREFIX, in6_dev, pinfo);
+adv_router:
+	/* RFC 8028 section 3.1: the router is a reasonable first hop for
+	 * source addresses in the prefix, whatever the flags of the option.
+	 */
+	if (router && pinfo->prefix_len && pinfo->prefix_len <= 128) {
+		if (valid_lft)
+			inet6_adv_prefix_set(in6_dev, &pinfo->prefix,
+					     pinfo->prefix_len, router,
+					     pinfo->flags, valid_lft,
+					     NLM_F_CREATE | NLM_F_REPLACE,
+					     GFP_ATOMIC, NULL);
+		else
+			inet6_adv_prefix_remove(in6_dev, &pinfo->prefix,
+						pinfo->prefix_len, router);
+	}
 put:
 	in6_dev_put(in6_dev);
 }
@@ -3990,6 +4160,9 @@ restart:
 		write_lock_bh(&idev->lock);
 	}
 
+	/* Step 3.5: forget the prefixes advertised by routers */
+	inet6_adv_prefixes_flush(idev, false);
+
 	list_for_each_entry(ifa, &idev->addr_list, if_list)
 		list_add_tail(&ifa->if_list_aux, &tmp_addr_list);
 	write_unlock_bh(&idev->lock);
@@ -4666,6 +4839,38 @@ int ipv6_chk_rpl_srh_loop(struct net *net, const struct in6_addr *segs,
  *	Periodic address status verification
  */
 
+/* Remove the prefixes advertised by routers when their lifetime ends, and
+ * find when the next one does.
+ */
+static void addrconf_verify_adv_prefixes(struct net *net, unsigned long *next)
+{
+	struct inet6_adv_prefix *p;
+	struct net_device *dev;
+	struct hlist_node *n;
+
+	/* Most namespaces have none, but may have many devices. */
+	if (!atomic_read(&net->ipv6.adv_prefixes))
+		return;
+
+	for_each_netdev(net, dev) {
+		struct inet6_dev *idev = __in6_dev_get(dev);
+
+		if (!idev)
+			continue;
+
+		write_lock(&idev->lock);
+		hlist_for_each_entry_safe(p, n, &idev->adv_prefixes, node) {
+			if (p->permanent)
+				continue;
+			if (inet6_adv_prefix_expired(p))
+				inet6_adv_prefix_del(idev, p);
+			else if (time_before(p->expires, *next))
+				*next = p->expires;
+		}
+		write_unlock(&idev->lock);
+	}
+}
+
 static void addrconf_verify_rtnl(struct net *net)
 {
 	unsigned long now, next, next_sec, next_sched;
@@ -4769,6 +4974,8 @@ restart:
 			}
 		}
 	}
+
+	addrconf_verify_adv_prefixes(net, &next);
 
 	next_sec = round_jiffies_up(next);
 	next_sched = next;
