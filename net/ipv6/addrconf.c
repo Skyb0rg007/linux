@@ -241,6 +241,7 @@ static struct ipv6_devconf ipv6_devconf __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.use_nexthop_prefixes	= 1,
 };
 
 static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
@@ -306,6 +307,7 @@ static struct ipv6_devconf ipv6_devconf_dflt __read_mostly = {
 	.ra_honor_pio_life	= 0,
 	.ra_honor_pio_pflag	= 0,
 	.force_forwarding	= 0,
+	.use_nexthop_prefixes	= 1,
 };
 
 /* Check if link is ready: is it up and is a valid qdisc available */
@@ -1677,6 +1679,39 @@ static int inet6_adv_prefix_remove(struct inet6_dev *idev,
 	return err;
 }
 
+/* Whether other routers than @router assigned the address or its prefix,
+ * but not @router (RFC 6724 rule 5.5), i.e. advertised a prefix that
+ * contains the subnet of the address. A longer prefix only covers part of
+ * the subnet: it is neither the prefix of the address nor what assigned it,
+ * and it would let a Prefix Information option rank the addresses of a
+ * subnet against each other, e.g. a stable address above a temporary one.
+ * The subnet is taken to be a /64 for addresses with a prefix length of at
+ * most 64, and for /128 addresses, e.g. from DHCPv6, which do not tell their
+ * subnet (RFC 4291).
+ *
+ * Must be called under rcu_read_lock().
+ */
+static bool ipv6_ifa_advertised_by_others(const struct inet6_ifaddr *ifp,
+					  const struct in6_addr *router)
+{
+	u8 max_len = ifp->prefix_len > 64 && ifp->prefix_len < 128 ?
+		     ifp->prefix_len : 64;
+	const struct inet6_adv_prefix *p;
+	bool others = false;
+
+	hlist_for_each_entry_rcu(p, &ifp->idev->adv_prefixes, node) {
+		if (p->prefix_len > max_len ||
+		    !ipv6_prefix_equal(&ifp->addr, &p->prefix, p->prefix_len) ||
+		    inet6_adv_prefix_expired(p))
+			continue;
+		if (ipv6_addr_equal(&p->router, router))
+			return false;
+		others = true;
+	}
+
+	return others;
+}
+
 /*
  *	Choose an appropriate source address (RFC3484)
  */
@@ -1689,6 +1724,7 @@ enum {
 	IPV6_SADDR_RULE_HOA,
 #endif
 	IPV6_SADDR_RULE_OIF,
+	IPV6_SADDR_RULE_NEXTHOP,
 	IPV6_SADDR_RULE_LABEL,
 	IPV6_SADDR_RULE_PRIVACY,
 	IPV6_SADDR_RULE_ORCHID,
@@ -1842,6 +1878,18 @@ static int ipv6_get_saddr_eval(struct net *net,
 		/* Rule 5: Prefer outgoing interface */
 		ret = (!dst->ifindex ||
 		       dst->ifindex == score->ifa->idev->dev->ifindex);
+		break;
+	case IPV6_SADDR_RULE_NEXTHOP:
+		/* Rule 5.5: Prefer addresses in a prefix advertised by the
+		 * next-hop, over the ones that a different next-hop assigned.
+		 * Addresses that no router assigned, e.g. static ones, tie
+		 * with the former.
+		 */
+		ret = !(dst->nexthop &&
+			dst->ifindex == score->ifa->idev->dev->ifindex &&
+			READ_ONCE(score->ifa->idev->cnf.use_nexthop_prefixes) &&
+			ipv6_ifa_advertised_by_others(score->ifa,
+						      dst->nexthop));
 		break;
 	case IPV6_SADDR_RULE_LABEL:
 		/* Rule 6: Prefer matching label */
@@ -6006,6 +6054,8 @@ static void ipv6_store_devconf(const struct ipv6_devconf *cnf,
 		READ_ONCE(cnf->accept_untracked_na);
 	array[DEVCONF_ACCEPT_RA_MIN_LFT] = READ_ONCE(cnf->accept_ra_min_lft);
 	array[DEVCONF_FORCE_FORWARDING] = READ_ONCE(cnf->force_forwarding);
+	array[DEVCONF_USE_NEXTHOP_PREFIXES] =
+		READ_ONCE(cnf->use_nexthop_prefixes);
 }
 
 static inline size_t inet6_ifla6_size(void)
@@ -7300,6 +7350,15 @@ static const struct ctl_table addrconf_sysctl[] = {
 	{
 		.procname	= "ra_honor_pio_pflag",
 		.data		= &ipv6_devconf.ra_honor_pio_pflag,
+		.maxlen		= sizeof(u8),
+		.mode		= 0644,
+		.proc_handler	= proc_dou8vec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "use_nexthop_prefixes",
+		.data		= &ipv6_devconf.use_nexthop_prefixes,
 		.maxlen		= sizeof(u8),
 		.mode		= 0644,
 		.proc_handler	= proc_dou8vec_minmax,
